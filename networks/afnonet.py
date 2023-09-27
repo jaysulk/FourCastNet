@@ -19,6 +19,43 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from utils.img_utils import PeriodicPad2d
 
+def dht(x: torch.Tensor):
+    X = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
+    X = X.real - X.imag
+    return X
+
+def idht(X: torch.Tensor):
+    # Get the size of each dimension
+    dims = X.size()
+    
+    # Calculate the normalization factor
+    n = torch.prod(torch.tensor(dims)).item()
+    
+    # Compute the DHT
+    X = dht(X)
+    
+    # Element-wise division for normalization
+    x = X / n
+    
+    return x
+
+def compl_mul2d(x, y):
+    """ Multiplies tensors a and b using the convolution theorem for the DHT.
+    Assumes hartley_transform and inverse_hartley_transform are defined.
+    """
+    X = dht(x)
+    Y = dht(y)
+    
+    Xflip = torch.roll(torch.flip(x, [0, 1]), shifts=(1, 1), dims=(0, 1))
+    Yflip = torch.roll(torch.flip(y, [0, 1]), shifts=(1, 1), dims=(0, 1))
+
+    Yplus = y + Yflip
+    Yminus = y - Yflip
+    Z = torch.einsum("..bi,bio->...bo", x, Yplus) + torch.einsum("..bi,bio->...bo",  Xflip, Yminus)
+    Z *= 0.5
+    z = idht(Z)
+    
+    return z
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -64,39 +101,33 @@ def forward(self, x):
     x = x.float()
     B, H, W, C = x.shape
 
-    # Compute 2D FFT
-    x_fft = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
+    x_hartley = dht(x)
+    x_hartley = x_hartley.reshape(B, H, W, self.num_blocks, self.block_size)
 
-    # Convert to Hartley Transform
-    x_hartley = x_fft.real - x_fft.imag
-    x_hartley = x_hartley.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
+    o1 = torch.zeros([B, H, W, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
 
-    o1 = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
-    o2 = torch.zeros(x_hartley.shape, device=x.device)
-
-    total_modes = H // 2 + 1
+    total_modes = H // 2
     kept_modes = int(total_modes * self.hard_thresholding_fraction)
 
-    o1[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-        torch.einsum('...bi,bio->...bo', x_hartley[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0]) - \
-        torch.einsum('...bi,bio->...bo', x_hartley[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[1]) + \
-        self.b1[0]
-    )
+    # o1 computation using compl_mul2d for Hartley-based multiplication
+    o1_addition = compl_mul2d(x_hartley[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0])
+    o1_subtraction = compl_mul2d(x_hartley[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[1])
+    o1_result = F.relu(o1_addition - o1_subtraction + self.b1[0])
 
-    o2[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]  = (
-        torch.einsum('...bi,bio->...bo', o1[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) - \
-        torch.einsum('...bi,bio->...bo', o1[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
-        self.b2[0]
-    )
+    o1[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = o1_result
 
-    # Convert back from Hartley to Complex for inverse FFT
-    x_complex = torch.view_as_complex(o2)
-    x = torch.fft.irfft2(x_complex, s=(H, W), dim=(1, 2), norm="ortho")
-    x = x.type(dtype)
+    # o2 computation using compl_mul2d for Hartley-based multiplication
+    o2_addition = compl_mul2d(o1[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0])
+    o2_subtraction = compl_mul2d(o1[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1])
+    o2_result = o2_addition - o2_subtraction + self.b2[0]
 
-    return x + bias
+    o2 = torch.zeros([B, H, W, self.num_blocks, self.block_size], device=x.device)
+    o2[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = o2_result
 
+    x_result = idht(o2)
+    x_result = x_result.type(dtype)
 
+    return x_result + bias
 
 class Block(nn.Module):
     def __init__(

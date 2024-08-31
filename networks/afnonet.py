@@ -19,43 +19,40 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from utils.img_utils import PeriodicPad2d
 
-def dht(x: torch.Tensor):
-    X = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
-    X = X.real - X.imag
+def dht(x: torch.Tensor) -> torch.Tensor:
+    # Perform rfftn on input of any dimensionality
+    X_rfft = torch.fft.rfftn(x, dim=tuple(range(1, x.ndim)))
+    
+    # Mirror the Fourier components and exclude the first column if the input size is even
+    mirrored_part = torch.flip(X_rfft, dims=[i + 1 for i in range(x.ndim - 1)]).conj()
+    
+    # Concatenate the original rfft result with the mirrored part
+    X_rfft_full = torch.cat([X_rfft, mirrored_part[..., 1:]], dim=-1)
+    
+    # Hartley transform computation
+    X = torch.real(X_rfft_full) - torch.imag(X_rfft_full)
+    
     return X
 
-def idht(X: torch.Tensor):
-    # Get the size of each dimension
-    dims = X.size()
-    
-    # Calculate the normalization factor
-    n = torch.prod(torch.tensor(dims)).item()
-    
-    # Compute the DHT
-    X = dht(X)
-    
-    # Element-wise division for normalization
-    x = X / n
-    
+def idht(X: torch.Tensor) -> torch.Tensor:
+    n = X.numel()  # Total number of elements in the tensor
+    X = dht(X)  # Apply DHT
+    x = X / n  # Normalize by the total number of elements
     return x
 
-def compl_mul2d(x, y):
-    """ Multiplies tensors a and b using the convolution theorem for the DHT.
-    Assumes hartley_transform and inverse_hartley_transform are defined.
-    """
-    X = dht(x)
-    Y = dht(y)
+def compl_mul2d(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+    X1_H_k = x1
+    X2_H_k = x2
+    X1_H_neg_k = torch.roll(torch.flip(x1, dims=[-1, -2]), shifts=(1, 1), dims=[-1, -2])
+    X2_H_neg_k = torch.roll(torch.flip(x2, dims=[-1, -2]), shifts=(1, 1), dims=[-1, -2])
     
-    Xflip = torch.roll(torch.flip(x, [0, 1]), shifts=(1, 1), dims=(0, 1))
-    Yflip = torch.roll(torch.flip(y, [0, 1]), shifts=(1, 1), dims=(0, 1))
+    result = 0.5 * (torch.einsum('bixy,ioxy->boxy', X1_H_k, X2_H_k) - 
+                    torch.einsum('bixy,ioxy->boxy', X1_H_neg_k, X2_H_neg_k) +
+                    torch.einsum('bixy,ioxy->boxy', X1_H_k, X2_H_neg_k) + 
+                    torch.einsum('bixy,ioxy->boxy', X1_H_neg_k, X2_H_k))
+    
+    return result
 
-    Yplus = y + Yflip
-    Yminus = y - Yflip
-    Z = torch.einsum("..bi,bio->...bo", x, Yplus) + torch.einsum("..bi,bio->...bo",  Xflip, Yminus)
-    Z *= 0.5
-    z = idht(Z)
-    
-    return z
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):

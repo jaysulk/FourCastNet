@@ -131,7 +131,7 @@ class Mlp(nn.Module):
 class AFNO2D(nn.Module):
     def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
         super().__init__()
-        assert hidden_size % num_blocks == 0, f"hidden_size {hidden_size} should be divisible by num_blocks {num_blocks}"
+        assert hidden_size % num_blocks == 0, f"hidden_size {hidden_size} should be divisble by num_blocks {num_blocks}"
 
         self.hidden_size = hidden_size
         self.sparsity_threshold = sparsity_threshold
@@ -146,27 +146,24 @@ class AFNO2D(nn.Module):
         self.w2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor, self.block_size))
         self.b2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size))
 
-    def forward(self, x, spatial_size=None):
+    def forward(self, x):
         bias = x
-    
+
         dtype = x.dtype
         x = x.float()
-        B, N, C = x.shape
-    
-        if spatial_size is None:
-            H = W = int(math.sqrt(N))
-        else:
-            H, W = spatial_size
-    
-        # Reshape x to (B, H, W, C)
-        x = x.reshape(B, H, W, C)
-    
-        # Replace FFT with DHT (assume x is already in DHT domain)
-        X_H_k = x  # DHT of x
-        X_H_neg_k = torch.roll(torch.flip(x, dims=[1, 2]), shifts=(1, 1), dims=[1, 2])
-    
-        block_size = self.block_size
-        hidden_size_factor = self.hidden_size_factor
+        B, H, W, C = x.shape
+
+        x = dht2d(x)
+        x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
+
+        o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
+        o1_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
+        o2_real = torch.zeros(x.shape, device=x.device)
+        o2_imag = torch.zeros(x.shape, device=x.device)
+
+
+        total_modes = H // 2 + 1
+        kept_modes = int(total_modes * self.hard_thresholding_fraction)
     
         # Ensure o1 and o2 dimensions match the expected sizes
         o1_H_k = torch.zeros([B, x.shape[1], x.shape[2], self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)

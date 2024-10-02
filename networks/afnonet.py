@@ -152,12 +152,7 @@ class AFNO2D(nn.Module):
         dtype = x.dtype
         x = x.float()
         B, H, W, C = x.shape
-    
-        if spatial_size is None:
-            H = W = int(math.sqrt(N))
-        else:
-            H, W = spatial_size
-    
+
         x = dht2d(x)
         x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
     

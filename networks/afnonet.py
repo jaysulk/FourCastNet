@@ -19,7 +19,7 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from utils.img_utils import PeriodicPad2d
 
-def dht(x: torch.Tensor) -> torch.Tensor:
+def dht2d(x: torch.Tensor) -> torch.Tensor:
     if x.ndim == 3:
         # 1D case (input is a 3D tensor)
         D, M, N = x.size()
@@ -72,9 +72,9 @@ def dht(x: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"Input tensor must be 3D, 4D, or 5D, but got {x.ndim}D with shape {x.shape}.")
 
 
-def idht(x: torch.Tensor) -> torch.Tensor:
+def idht2d(x: torch.Tensor) -> torch.Tensor:
     # Compute the DHT
-    transformed = dht(x)
+    transformed = dht2d(x)
     
     # Determine normalization factor
     if x.ndim == 3:

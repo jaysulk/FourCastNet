@@ -58,7 +58,7 @@ class AFNO2D(nn.Module):
 
         # Reshape and align the dimensions of X_H_k and X_H_neg_k for broadcasting
         X_H_k = x 
-        X_H_neg_k = torch.roll(torch.flip(x, dims=[2]), shifts=(1, 0), dims=[2])
+        X_H_neg_k = torch.roll(torch.flip(x, dims=[2]), shifts=(1,), dims=[3])
 
         kept_modes = int(H * self.hard_thresholding_fraction)
 

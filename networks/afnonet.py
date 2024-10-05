@@ -9,7 +9,8 @@ import torch
 
 def dht2d(x: torch.Tensor) -> torch.Tensor:
     """
-    Apply the 2D Discrete Hartley Transform (DHT) to a tensor `x`.
+    Apply the 2D Discrete Hartley Transform (DHT) to a tensor `x` in a manner
+    that mimics torch.fft.rfft2 by returning only the first half of the frequency domain.
     """
     
     # Get the input dimensions
@@ -29,7 +30,11 @@ def dht2d(x: torch.Tensor) -> torch.Tensor:
     X = torch.matmul(cas_row, intermediate)  # Apply DHT to rows
 
     # Reshape back to the original shape
-    return X.reshape(B, D, H, W)
+    X = X.reshape(B, D, H, W)
+
+    # Mimic rfft2 by returning only the first half of the spectrum along the W dimension
+    return X[:, :, :, : (W // 2 + 1)]
+
 
 def idht2d(x: torch.Tensor) -> torch.Tensor:
     transformed = dht2d(x)

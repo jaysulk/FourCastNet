@@ -115,8 +115,79 @@ class AFNO2D(nn.Module):
         x = x.reshape(B, D, H, W)
         return x
 
+class Block(nn.Module):
+    def __init__(
+            self,
+            dim,
+            mlp_ratio=4.,
+            drop=0.,
+            drop_path=0.,
+            act_layer=nn.GELU,
+            norm_layer=nn.LayerNorm,
+            double_skip=True,
+            num_blocks=8,
+            sparsity_threshold=0.01,
+            hard_thresholding_fraction=1.0
+        ):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.filter = AFNO2D(dim, num_blocks, sparsity_threshold, hard_thresholding_fraction) 
+        self.drop_path = nn.Identity() if drop_path <= 0. else nn.Dropout(drop_path)
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.double_skip = double_skip
+
+    def forward(self, x):
+        residual = x
+        x = self.norm1(x)
+        x = self.filter(x)
+
+        if self.double_skip:
+            x = x + residual
+            residual = x
+
+        x = self.norm2(x)
+        x = self.mlp(x)
+        x = self.drop_path(x)
+        x = x + residual
+        return x
+
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
 class AFNONet(nn.Module):
-    def __init__(self, params, img_size=(720, 1440), patch_size=(16, 16), in_chans=2, out_chans=2, embed_dim=768, depth=12, mlp_ratio=4., drop_rate=0., drop_path_rate=0., num_blocks=16, sparsity_threshold=0.01, hard_thresholding_fraction=1.0):
+    def __init__(
+            self,
+            params,
+            img_size=(720, 1440),
+            patch_size=(16, 16),
+            in_chans=2,
+            out_chans=2,
+            embed_dim=768,
+            depth=12,
+            mlp_ratio=4.,
+            drop_rate=0.,
+            drop_path_rate=0.,
+            num_blocks=16,
+            sparsity_threshold=0.01,
+            hard_thresholding_fraction=1.0,
+        ):
         super().__init__()
         self.params = params
         self.img_size = img_size

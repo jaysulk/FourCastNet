@@ -65,18 +65,14 @@ class AFNO2D(nn.Module):
         self.b2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size))
 
     def forward(self, x):
-        B, D, H, W = x.shape  # Input shape [B, D, H, W]
-    
-        # Apply DHT (Discrete Hartley Transform)
+        bias = x
+
+        dtype = x.dtype
+        x = x.float()
+        B, H, W, C = x.shape
+
         x = dht2d(x)
-    
-        # Ensure the total number of elements remains the same after reshape
-        total_elements = B * D * H * (W // 2 + 1) * self.num_blocks * self.block_size
-        if x.numel() != total_elements:
-            raise RuntimeError(f"Reshaping error: the expected total number of elements is {total_elements}, but got {x.numel()}.")
-    
-        # Reshape the result to have the number of blocks
-        x = x.reshape(B, D, H, (W // 2 + 1), self.num_blocks, self.block_size)
+        x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
     
         # Flip and roll to get the negative frequency components
         X_H_k = x 

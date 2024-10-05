@@ -51,68 +51,79 @@ class AFNO2D(nn.Module):
         self.b2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size))
 
     def forward(self, x):
-        B, D, H, W = x.shape  # Changed to reflect the input shape [B, D, H, W]
+        B, D, H, W = x.shape  # Input shape [B, D, H, W]
         
+        # Apply DHT (Discrete Hartley Transform)
         x = dht2d(x)
-        x = x.reshape(B, D, (W // 2 + 1), self.num_blocks)
-
-        # Reshape and align the dimensions of X_H_k and X_H_neg_k for broadcasting
+        
+        # Reshape the result to have the number of blocks
+        x = x.reshape(B, D, H, (W // 2 + 1), self.num_blocks, self.block_size)
+        
+        # Flip and roll to get the negative frequency components
         X_H_k = x 
-        X_H_neg_k = torch.roll(torch.flip(x, dims=[2]), shifts=(1,), dims=[3])
-
+        X_H_neg_k = torch.roll(torch.flip(x, dims=[3]), shifts=(1,), dims=[3])  # Correct shift and dims
+        
+        # Number of modes to keep
         kept_modes = int(H * self.hard_thresholding_fraction)
-
-        # Ensure o1 and o2 dimensions match the expected sizes
+    
+        # Initialize tensors for the results of the first multiplication
         o1_H_k = torch.zeros([B, D, H, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
         o1_H_neg_k = torch.zeros([B, D, H, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
-
+    
+        # Perform the first multiplication using w1
         o1_H_k[:, :, :kept_modes] = F.relu(
             0.5 * (
-                torch.einsum('...bi,bio->...bo', X_H_k[:, :, :kept_modes], self.w1[0]) -
-                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, :, :kept_modes], self.w1[1]) +
-                torch.einsum('...bi,bio->...bo', X_H_k[:, :, :kept_modes], self.w1[1]) +
+                torch.einsum('...bi,bio->...bo', X_H_k[:, :, :kept_modes], self.w1[0]) - 
+                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, :, :kept_modes], self.w1[1]) + 
+                torch.einsum('...bi,bio->...bo', X_H_k[:, :, :kept_modes], self.w1[1]) + 
                 torch.einsum('...bi,bio->...bo', X_H_neg_k[:, :, :kept_modes], self.w1[0])
             ) + self.b1[0]
         )
-
+    
         o1_H_neg_k[:, :, :kept_modes] = F.relu(
             0.5 * (
-                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, :, :kept_modes], self.w1[0]) -
-                torch.einsum('...bi,bio->...bo', X_H_k[:, :, :kept_modes], self.w1[1]) +
-                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, :, :kept_modes], self.w1[1]) +
+                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, :, :kept_modes], self.w1[0]) - 
+                torch.einsum('...bi,bio->...bo', X_H_k[:, :, :kept_modes], self.w1[1]) + 
+                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, :, :kept_modes], self.w1[1]) + 
                 torch.einsum('...bi,bio->...bo', X_H_k[:, :, :kept_modes], self.w1[0])
             ) + self.b1[1]
         )
-
-        # Perform second multiplication similar to the first
+    
+        # Initialize tensors for the results of the second multiplication
         o2_H_k = torch.zeros(X_H_k.shape, device=x.device)
         o2_H_neg_k = torch.zeros(X_H_k.shape, device=x.device)
-
+    
+        # Perform the second multiplication using w2
         o2_H_k[:, :, :kept_modes] = (
             0.5 * (
-                torch.einsum('...bi,bio->...bo', o1_H_k[:, :, :kept_modes], self.w2[0]) -
-                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, :, :kept_modes], self.w2[1]) +
-                torch.einsum('...bi,bio->...bo', o1_H_k[:, :, :kept_modes], self.w2[1]) +
+                torch.einsum('...bi,bio->...bo', o1_H_k[:, :, :kept_modes], self.w2[0]) - 
+                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, :, :kept_modes], self.w2[1]) + 
+                torch.einsum('...bi,bio->...bo', o1_H_k[:, :, :kept_modes], self.w2[1]) + 
                 torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, :, :kept_modes], self.w2[0])
             ) + self.b2[0]
         )
-
+    
         o2_H_neg_k[:, :, :kept_modes] = (
             0.5 * (
-                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, :, :kept_modes], self.w2[0]) -
-                torch.einsum('...bi,bio->...bo', o2_H_k[:, :, :kept_modes], self.w2[1]) +
-                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, :, :kept_modes], self.w2[1]) +
+                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, :, :kept_modes], self.w2[0]) - 
+                torch.einsum('...bi,bio->...bo', o2_H_k[:, :, :kept_modes], self.w2[1]) + 
+                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, :, :kept_modes], self.w2[1]) + 
                 torch.einsum('...bi,bio->...bo', o2_H_k[:, :, :kept_modes], self.w2[0])
             ) + self.b2[1]
         )
-
+    
         # Combine positive and negative frequency components back
         x = o2_H_k + o2_H_neg_k
+        
+        # Apply softshrink to enforce sparsity
         x = F.softshrink(x, lambd=self.sparsity_threshold)
-
-        # Transform back to spatial domain (assuming DHT-based iDHT here)
+    
+        # Transform back to the spatial domain using the inverse DHT (idht2d)
         x = idht2d(x)
+    
+        # Reshape back to the original input shape
         x = x.reshape(B, D, H, W)
+        
         return x
 
 class Block(nn.Module):

@@ -54,7 +54,7 @@ class AFNO2D(nn.Module):
         B, D, H, W = x.shape  # Changed to reflect the input shape [B, D, H, W]
         
         x = dht2d(x)
-        #x = x.reshape(B, D, H, W // 2 + 1, self.num_blocks, self.block_size)
+        x = x.reshape(B, D, (W // 2 + 1), self.num_blocks)
 
         # Reshape and align the dimensions of X_H_k and X_H_neg_k for broadcasting
         X_H_k = x 

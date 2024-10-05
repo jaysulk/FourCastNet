@@ -7,11 +7,13 @@ from einops import rearrange
 
 import torch
 
-def dht2d(x: torch.Tensor) -> torch.Tensor:
+def dht2d_rfft(x: torch.Tensor) -> torch.Tensor:
     """
     Apply the 2D Discrete Hartley Transform (DHT) to a tensor `x` in a manner
     that mimics torch.fft.rfft2 by returning only the first half of the frequency domain.
     """
+    if x.ndim != 4:
+        raise ValueError(f"Input tensor must be 4D, but got {x.ndim}D with shape {x.shape}.")
     
     # Get the input dimensions
     B, D, H, W = x.shape
@@ -35,9 +37,8 @@ def dht2d(x: torch.Tensor) -> torch.Tensor:
     # Mimic rfft2 by returning only the first half of the spectrum along the W dimension
     return X[:, :, :, : (W // 2 + 1)]
 
-
 def idht2d(x: torch.Tensor) -> torch.Tensor:
-    transformed = dht2d(x)
+    transformed = dht2d_rfft(x)
     
     # Determine normalization factor
     B, D, M, N = x.size()
@@ -65,26 +66,36 @@ class AFNO2D(nn.Module):
         self.b2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size))
 
     def forward(self, x):
-        bias = x
+        B, D, H, W = x.shape  # Input shape [B, D, H, W]
 
-        dtype = x.dtype
-        x = x.float()
-        B, H, W, C = x.shape
+        # Apply DHT (Discrete Hartley Transform)
+        x = dht2d_rfft(x)
 
-        x = dht2d(x)
-        x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
-    
+        # Get the number of frequency components along the W dimension after DHT
+        freq_components = W // 2 + 1
+
+        # Dynamically calculate block_size based on input num_blocks
+        # Ensure that block_size divides freq_components
+        if freq_components % self.num_blocks != 0:
+            raise ValueError(f"Frequency components {freq_components} must be divisible by num_blocks {self.num_blocks}")
+        
+        # Adjust block_size dynamically
+        self.block_size = freq_components // self.num_blocks
+
+        # Reshape to match num_blocks and block_size
+        x = x.reshape(B, H, freq_components, self.num_blocks, self.block_size)
+
         # Flip and roll to get the negative frequency components
         X_H_k = x 
-        X_H_neg_k = torch.roll(torch.flip(x, dims=[3]), shifts=(1,), dims=[3])
-    
+        X_H_neg_k = torch.roll(torch.flip(x, dims=[2]), shifts=(1,), dims=[2])
+
         # Number of modes to keep
         kept_modes = int(H * self.hard_thresholding_fraction)
-    
+
         # Initialize tensors for the results of the first multiplication
         o1_H_k = torch.zeros([B, D, H, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
         o1_H_neg_k = torch.zeros([B, D, H, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
-    
+
         # Perform the first multiplication using w1
         o1_H_k[:, :, :kept_modes] = F.relu(
             0.5 * (
@@ -94,7 +105,7 @@ class AFNO2D(nn.Module):
                 torch.einsum('...bi,bio->...bo', X_H_neg_k[:, :, :kept_modes], self.w1[0])
             ) + self.b1[0]
         )
-    
+
         o1_H_neg_k[:, :, :kept_modes] = F.relu(
             0.5 * (
                 torch.einsum('...bi,bio->...bo', X_H_neg_k[:, :, :kept_modes], self.w1[0]) - 
@@ -103,11 +114,11 @@ class AFNO2D(nn.Module):
                 torch.einsum('...bi,bio->...bo', X_H_k[:, :, :kept_modes], self.w1[0])
             ) + self.b1[1]
         )
-    
+
         # Initialize tensors for the results of the second multiplication
         o2_H_k = torch.zeros(X_H_k.shape, device=x.device)
         o2_H_neg_k = torch.zeros(X_H_k.shape, device=x.device)
-    
+
         # Perform the second multiplication using w2
         o2_H_k[:, :, :kept_modes] = (
             0.5 * (
@@ -117,7 +128,7 @@ class AFNO2D(nn.Module):
                 torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, :, :kept_modes], self.w2[0])
             ) + self.b2[0]
         )
-    
+
         o2_H_neg_k[:, :, :kept_modes] = (
             0.5 * (
                 torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, :, :kept_modes], self.w2[0]) - 
@@ -126,22 +137,20 @@ class AFNO2D(nn.Module):
                 torch.einsum('...bi,bio->...bo', o2_H_k[:, :, :kept_modes], self.w2[0])
             ) + self.b2[1]
         )
-    
+
         # Combine positive and negative frequency components back
         x = o2_H_k + o2_H_neg_k
         
         # Apply softshrink to enforce sparsity
         x = F.softshrink(x, lambd=self.sparsity_threshold)
-    
+
         # Transform back to the spatial domain using the inverse DHT (idht2d)
         x = idht2d(x)
-    
+
         # Reshape back to the original input shape
         x = x.reshape(B, D, H, W)
         
         return x
-
-
 
 class Block(nn.Module):
     def __init__(

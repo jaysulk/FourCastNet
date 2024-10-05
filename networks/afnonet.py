@@ -64,8 +64,9 @@ class AFNO2D(nn.Module):
         x = x.float()
         B, H, W, C = x.shape
 
-        x = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
-        x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
+        # Perform DHT
+        x = self.dht2d(x)  
+        x = x.reshape(B, C, H, W // 2 + 1, self.num_blocks)
 
         o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
         o1_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)

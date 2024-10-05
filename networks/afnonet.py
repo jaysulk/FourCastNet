@@ -5,22 +5,31 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+import torch
+
 def dht2d(x: torch.Tensor) -> torch.Tensor:
+    """
+    Apply the 2D Discrete Hartley Transform (DHT) to a tensor `x`.
+    """
     
-    # 2D case (input is a 4D tensor)
-    B, D, M, N = x.size()
-    m = torch.arange(M, device=x.device).float()
-    n = torch.arange(N, device=x.device).float()
+    # Get the input dimensions
+    B, D, H, W = x.shape
 
-    # Hartley kernels for rows and columns
-    cas_row = torch.cos(2 * torch.pi * m.view(-1, 1) * m / M) + torch.sin(2 * torch.pi * m.view(-1, 1) * m / M)
-    cas_col = torch.cos(2 * torch.pi * n.view(-1, 1) * n / N) + torch.sin(2 * torch.pi * n.view(-1, 1) * n / N)
+    # Create the Hartley kernels for the row and column transforms
+    m = torch.arange(H, device=x.device).float()
+    n = torch.arange(W, device=x.device).float()
 
-    # Perform the DHT
-    x_reshaped = x.reshape(B * D, M, N)
-    intermediate = torch.matmul(x_reshaped, cas_col)
-    X = torch.matmul(cas_row, intermediate)
-    return X.reshape(B, D, M, N)
+    # Create 2D Hartley kernels
+    cas_row = torch.cos(2 * torch.pi * m.view(-1, 1) * m / H) + torch.sin(2 * torch.pi * m.view(-1, 1) * m / H)
+    cas_col = torch.cos(2 * torch.pi * n.view(-1, 1) * n / W) + torch.sin(2 * torch.pi * n.view(-1, 1) * n / W)
+
+    # Perform the DHT in two steps: first along columns, then along rows
+    x_reshaped = x.reshape(B * D, H, W)  # Flatten batch and channel dimensions
+    intermediate = torch.matmul(x_reshaped, cas_col)  # Apply DHT to columns
+    X = torch.matmul(cas_row, intermediate)  # Apply DHT to rows
+
+    # Reshape back to the original shape
+    return X.reshape(B, D, H, W)
 
 def idht2d(x: torch.Tensor) -> torch.Tensor:
     transformed = dht2d(x)

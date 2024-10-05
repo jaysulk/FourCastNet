@@ -7,38 +7,34 @@ from einops import rearrange
 
 import torch
 
-def dht2d_rfft(x: torch.Tensor) -> torch.Tensor:
+def dht2d(x: torch.Tensor) -> torch.Tensor:
     """
-    Apply the 2D Discrete Hartley Transform (DHT) to a tensor `x` in a manner
-    that mimics torch.fft.rfft2 by returning only the first half of the frequency domain.
+    Apply the 2D Discrete Hartley Transform (DHT) to a tensor `x`.
+    The DHT retains the full frequency resolution, so the output will
+    have the same shape as the input.
     """
     if x.ndim != 4:
         raise ValueError(f"Input tensor must be 4D, but got {x.ndim}D with shape {x.shape}.")
     
-    # Get the input dimensions
     B, D, H, W = x.shape
 
     # Create the Hartley kernels for the row and column transforms
     m = torch.arange(H, device=x.device).float()
     n = torch.arange(W, device=x.device).float()
 
-    # Create 2D Hartley kernels
+    # Hartley kernels for rows and columns
     cas_row = torch.cos(2 * torch.pi * m.view(-1, 1) * m / H) + torch.sin(2 * torch.pi * m.view(-1, 1) * m / H)
     cas_col = torch.cos(2 * torch.pi * n.view(-1, 1) * n / W) + torch.sin(2 * torch.pi * n.view(-1, 1) * n / W)
 
     # Perform the DHT in two steps: first along columns, then along rows
-    x_reshaped = x.reshape(B * D, H, W)  # Flatten batch and channel dimensions
-    intermediate = torch.matmul(x_reshaped, cas_col)  # Apply DHT to columns
-    X = torch.matmul(cas_row, intermediate)  # Apply DHT to rows
+    x_reshaped = x.reshape(B * D, H, W)
+    intermediate = torch.matmul(x_reshaped, cas_col)  # DHT on columns
+    X = torch.matmul(cas_row, intermediate)  # DHT on rows
 
-    # Reshape back to the original shape
-    X = X.reshape(B, D, H, W)
-
-    # Mimic rfft2 by returning only the first half of the spectrum along the W dimension
-    return X[:, :, :, : (W // 2 + 1)]
+    return X.reshape(B, D, H, W)  # Full frequency resolution
 
 def idht2d(x: torch.Tensor) -> torch.Tensor:
-    transformed = dht2d_rfft(x)
+    transformed = dht2d(x)
     
     # Determine normalization factor
     B, D, M, N = x.size()
@@ -62,23 +58,36 @@ class AFNO2D(nn.Module):
         self.w2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.hidden_size // self.num_blocks * self.hidden_size_factor, self.hidden_size // self.num_blocks))
         self.b2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.hidden_size // self.num_blocks))
 
+class AFNO2D(nn.Module):
+    def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
+        super().__init__()
+        assert hidden_size % num_blocks == 0, f"hidden_size {hidden_size} should be divisible by num_blocks {num_blocks}"
+
+        self.hidden_size = hidden_size
+        self.sparsity_threshold = sparsity_threshold
+        self.num_blocks = num_blocks
+        self.block_size = self.hidden_size // self.num_blocks
+        self.hard_thresholding_fraction = hard_thresholding_fraction
+        self.hidden_size_factor = hidden_size_factor
+        self.scale = 0.02
+
+        self.w1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size, self.block_size * self.hidden_size_factor))
+        self.b1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor))
+        self.w2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor, self.block_size))
+        self.b2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size))
+
     def forward(self, x):
+        bias = x
+
+        dtype = x.dtype
+        x = x.float()
         B, D, H, W = x.shape
-        x = dht2d_rfft(x)
 
-        freq_components = W // 2 + 1
+        # Apply DHT (Discrete Hartley Transform)
+        x = dht2d(x)
 
-        # Adjust num_blocks to fit the number of frequency components
-        while freq_components % self.num_blocks != 0:
-            self.num_blocks -= 1
-            if self.num_blocks == 0:
-                raise ValueError(f"Unable to adjust num_blocks to evenly divide frequency components {freq_components}.")
-
-        # Adjust block_size based on num_blocks
-        block_size = freq_components // self.num_blocks
-
-        # Reshape the tensor
-        x = x.reshape(B, H, freq_components, self.num_blocks, block_size)
+        # Now reshape without reducing the frequency dimension (keep full W)
+        x = x.reshape(B, D, H, W, self.num_blocks, self.block_size)
 
         # Perform operations as before
         X_H_k = x 

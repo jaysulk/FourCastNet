@@ -7,11 +7,16 @@ from einops import rearrange
 
 def dht2d(x: torch.Tensor) -> torch.Tensor:
     """
-    Apply the 2D Discrete Hartley Transform (DHT) to a tensor x.
+    Apply the 2D Discrete Hartley Transform (DHT) to a tensor `x`.
     The DHT retains the full frequency resolution, so the output will
     have the same shape as the input.
     """
-    B, D, H, W = x.shape
+    # Ensure that the input tensor has 4 dimensions
+    if x.ndim != 4:
+        raise ValueError(f"Input tensor must be 4D, but got {x.ndim}D with shape {x.shape}.")
+
+    # Unpack dimensions as (Batch, Channels, Height, Width)
+    B, C, H, W = x.shape
 
     # Create the Hartley kernels for the row and column transforms
     m = torch.arange(H, device=x.device).float()
@@ -22,19 +27,24 @@ def dht2d(x: torch.Tensor) -> torch.Tensor:
     cas_col = torch.cos(2 * torch.pi * n.view(-1, 1) * n / W) + torch.sin(2 * torch.pi * n.view(-1, 1) * n / W)
 
     # Perform the DHT in two steps: first along columns, then along rows
-    x_reshaped = x.reshape(B * D, H, W)
+    x_reshaped = x.reshape(B * C, H, W)  # Flatten batch and channels
     intermediate = torch.matmul(x_reshaped, cas_col)  # DHT on columns
     X = torch.matmul(cas_row, intermediate)  # DHT on rows
 
-    return X.reshape(B, D, H, W)  # Full frequency resolution
+    return X.reshape(B, C, H, W)  # Return to original shape
 
 def idht2d(x: torch.Tensor) -> torch.Tensor:
-    transformed = dht2d(x)
-    
-    # Determine normalization factor
-    B, D, M, N = x.size()
-    normalization_factor = M * N
-    
+    """
+    Apply the inverse 2D Discrete Hartley Transform (iDHT) to a tensor `x`.
+    This function uses the same DHT as the forward transform but divides
+    the result by the normalization factor (M * N).
+    """
+    transformed = dht2d(x)  # Apply DHT for inverse
+
+    # Determine normalization factor based on the size of the image
+    B, C, H, W = x.size()
+    normalization_factor = H * W  # The product of the height and width
+
     # Normalize the transformed result
     return transformed / normalization_factor
 

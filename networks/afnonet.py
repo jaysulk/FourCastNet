@@ -43,41 +43,54 @@ def idht2d(x: torch.Tensor) -> torch.Tensor:
     # Normalize the transformed result
     return transformed / normalization_factor
 
+import torch
+import torch.nn.functional as F
+
 class AFNO2D(nn.Module):
     def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
         super().__init__()
-        assert hidden_size % num_blocks == 0, f"hidden_size {hidden_size} should be divisible by num_blocks {num_blocks}"
-
         self.hidden_size = hidden_size
         self.sparsity_threshold = sparsity_threshold
         self.num_blocks = num_blocks
-        self.block_size = self.hidden_size // self.num_blocks
         self.hard_thresholding_fraction = hard_thresholding_fraction
         self.hidden_size_factor = hidden_size_factor
         self.scale = 0.02
 
-        # Initialize weight matrices for convolutions
-        self.w1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size, self.block_size * self.hidden_size_factor))
-        self.b1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor))
-        self.w2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor, self.block_size))
-        self.b2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size))
+        # These parameters will be set during forward pass
+        self.w1 = None
+        self.b1 = None
+        self.w2 = None
+        self.b2 = None
 
     def forward(self, x):
         B, D, H, W = x.shape  # Input shape is [Batch, Depth (channels), Height, Width]
 
-        # Apply DHT (Discrete Hartley Transform) - this keeps the full frequency range
+        # Dynamically adjust num_blocks if D is not divisible by num_blocks
+        if D % self.num_blocks != 0:
+            # Find the largest divisor of D that is <= num_blocks
+            for nb in range(self.num_blocks, 0, -1):
+                if D % nb == 0:
+                    self.num_blocks = nb
+                    break
+
+        # Calculate block size dynamically
+        block_size = D // self.num_blocks
+
+        # Initialize weight matrices with updated num_blocks and block_size
+        if self.w1 is None:
+            self.w1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, block_size, block_size * self.hidden_size_factor))
+            self.b1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, block_size * self.hidden_size_factor))
+            self.w2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, block_size * self.hidden_size_factor, block_size))
+            self.b2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, block_size))
+
+        # Apply DHT (Discrete Hartley Transform)
         x = dht2d(x)
 
-        # After the DHT, reshape x into [B, D, H, num_blocks, block_size]
-        X_H_k = x.reshape(B, D, H, self.num_blocks, self.block_size)
+        # Reshape the DHT output
+        X_H_k = x.reshape(B, D, H, self.num_blocks, block_size)
         X_H_neg_k = torch.roll(torch.flip(X_H_k, dims=[2]), shifts=(1,), dims=[2])
 
         kept_modes = int(H * self.hard_thresholding_fraction)
-
-        # Ensure that block_size matches with input dimension D divided by num_blocks
-        block_size = D // self.num_blocks
-        if D % self.num_blocks != 0:
-            raise ValueError(f"Dimension D ({D}) must be divisible by num_blocks ({self.num_blocks})")
 
         # First convolution step - output tensors for direct and negative components
         o1_H_k = torch.zeros([B, D, H, self.num_blocks, block_size * self.hidden_size_factor], device=x.device)

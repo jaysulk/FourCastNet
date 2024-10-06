@@ -7,42 +7,6 @@ from einops import rearrange
 
 import torch
 
-def dht2d(x: torch.Tensor) -> torch.Tensor:
-    """
-    Apply the 2D Discrete Hartley Transform (DHT) to a tensor `x`.
-    The DHT retains the full frequency resolution, so the output will
-    have the same shape as the input.
-    """
-    if x.ndim != 4:
-        raise ValueError(f"Input tensor must be 4D, but got {x.ndim}D with shape {x.shape}.")
-    
-    B, D, H, W = x.shape
-
-    # Create the Hartley kernels for the row and column transforms
-    m = torch.arange(H, device=x.device).float()
-    n = torch.arange(W, device=x.device).float()
-
-    # Hartley kernels for rows and columns
-    cas_row = torch.cos(2 * torch.pi * m.view(-1, 1) * m / H) + torch.sin(2 * torch.pi * m.view(-1, 1) * m / H)
-    cas_col = torch.cos(2 * torch.pi * n.view(-1, 1) * n / W) + torch.sin(2 * torch.pi * n.view(-1, 1) * n / W)
-
-    # Perform the DHT in two steps: first along columns, then along rows
-    x_reshaped = x.reshape(B * D, H, W)
-    intermediate = torch.matmul(x_reshaped, cas_col)  # DHT on columns
-    X = torch.matmul(cas_row, intermediate)  # DHT on rows
-
-    return X.reshape(B, D, H, W)  # Full frequency resolution
-
-def idht2d(x: torch.Tensor) -> torch.Tensor:
-    transformed = dht2d(x)
-    
-    # Determine normalization factor
-    B, D, M, N = x.size()
-    normalization_factor = M * N
-    
-    # Normalize the transformed result
-    return transformed / normalization_factor
-
 import torch
 import torch.nn.functional as F
 
@@ -65,16 +29,16 @@ class AFNO2D(nn.Module):
     def forward(self, x):
         B, D, H, W = x.shape  # Input shape is [Batch, Depth (channels), Height, Width]
 
-        # Dynamically adjust num_blocks if D is not divisible by num_blocks
-        if D % self.num_blocks != 0:
-            # Find the largest divisor of D that is <= num_blocks
-            for nb in range(self.num_blocks, 0, -1):
-                if D % nb == 0:
-                    self.num_blocks = nb
-                    break
+        # Calculate how much padding is required
+        target_D = ((D + self.num_blocks - 1) // self.num_blocks) * self.num_blocks  # Nearest multiple of num_blocks
+        padding = target_D - D  # Calculate how much padding is needed (e.g., 96 - 90 = 6)
+        
+        # Apply padding to the depth dimension (channels)
+        if padding > 0:
+            x = F.pad(x, (0, 0, 0, 0, 0, padding))  # Padding the D dimension
 
-        # Calculate block size dynamically
-        block_size = D // self.num_blocks
+        # Calculate block size based on the new D value
+        block_size = target_D // self.num_blocks
 
         # Initialize weight matrices with updated num_blocks and block_size
         if self.w1 is None:
@@ -86,15 +50,15 @@ class AFNO2D(nn.Module):
         # Apply DHT (Discrete Hartley Transform)
         x = dht2d(x)
 
-        # Reshape the DHT output
-        X_H_k = x.reshape(B, D, H, self.num_blocks, block_size)
+        # Reshape the DHT output to [B, D, H, num_blocks, block_size]
+        X_H_k = x.reshape(B, target_D, H, self.num_blocks, block_size)
         X_H_neg_k = torch.roll(torch.flip(X_H_k, dims=[2]), shifts=(1,), dims=[2])
 
         kept_modes = int(H * self.hard_thresholding_fraction)
 
         # First convolution step - output tensors for direct and negative components
-        o1_H_k = torch.zeros([B, D, H, self.num_blocks, block_size * self.hidden_size_factor], device=x.device)
-        o1_H_neg_k = torch.zeros([B, D, H, self.num_blocks, block_size * self.hidden_size_factor], device=x.device)
+        o1_H_k = torch.zeros([B, target_D, H, self.num_blocks, block_size * self.hidden_size_factor], device=x.device)
+        o1_H_neg_k = torch.zeros([B, target_D, H, self.num_blocks, block_size * self.hidden_size_factor], device=x.device)
 
         # Apply first convolution
         o1_H_k[:, :, :kept_modes] = F.relu(
@@ -143,6 +107,9 @@ class AFNO2D(nn.Module):
 
         # Apply softshrink to enforce sparsity
         x = F.softshrink(x, lambd=self.sparsity_threshold)
+
+        # Remove the padding from D
+        x = x[:, :D, :, :]  # Remove padded channels to return to the original D = 90 shape
 
         # Reshape back to original size [B, D, H, W]
         x = x.reshape(B, D, H, W)

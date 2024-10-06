@@ -5,11 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-import torch
-
-import torch
-import torch.nn.functional as F
-
 class AFNO2D(nn.Module):
     def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
         super().__init__()

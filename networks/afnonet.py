@@ -46,21 +46,6 @@ def idht2d(x: torch.Tensor) -> torch.Tensor:
 class AFNO2D(nn.Module):
     def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.sparsity_threshold = sparsity_threshold
-        self.num_blocks = num_blocks
-        self.hard_thresholding_fraction = hard_thresholding_fraction
-        self.hidden_size_factor = hidden_size_factor
-        self.scale = 0.02
-
-        self.w1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.hidden_size // self.num_blocks, self.hidden_size // self.num_blocks * self.hidden_size_factor))
-        self.b1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.hidden_size // self.num_blocks * self.hidden_size_factor))
-        self.w2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.hidden_size // self.num_blocks * self.hidden_size_factor, self.hidden_size // self.num_blocks))
-        self.b2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.hidden_size // self.num_blocks))
-
-class AFNO2D(nn.Module):
-    def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
-        super().__init__()
         assert hidden_size % num_blocks == 0, f"hidden_size {hidden_size} should be divisible by num_blocks {num_blocks}"
 
         self.hidden_size = hidden_size
@@ -71,33 +56,29 @@ class AFNO2D(nn.Module):
         self.hidden_size_factor = hidden_size_factor
         self.scale = 0.02
 
+        # Weight matrices for convolution
         self.w1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size, self.block_size * self.hidden_size_factor))
         self.b1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor))
         self.w2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor, self.block_size))
         self.b2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size))
 
     def forward(self, x):
-        bias = x
-
-        dtype = x.dtype
-        x = x.float()
-        B, D, H, W = x.shape
+        B, D, H, W = x.shape  # Assume input is [Batch, Depth, Height, Width]
 
         # Apply DHT (Discrete Hartley Transform)
         x = dht2d(x)
 
-        # Now reshape without reducing the frequency dimension (keep full W)
-        x = x.reshape(B, D, H, W, self.num_blocks, self.block_size)
-
-        # Perform operations as before
-        X_H_k = x 
+        # Compute X_H_k (direct Hartley components) and X_H_neg_k (negative components)
+        X_H_k = x
         X_H_neg_k = torch.roll(torch.flip(x, dims=[2]), shifts=(1,), dims=[2])
 
         kept_modes = int(H * self.hard_thresholding_fraction)
 
-        o1_H_k = torch.zeros([B, D, H, self.num_blocks, block_size * self.hidden_size_factor], device=x.device)
-        o1_H_neg_k = torch.zeros([B, D, H, self.num_blocks, block_size * self.hidden_size_factor], device=x.device)
+        # Initialize output tensors for positive and negative Hartley components
+        o1_H_k = torch.zeros([B, D, H, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
+        o1_H_neg_k = torch.zeros([B, D, H, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
 
+        # Apply the first linear transformation with ReLU activation
         o1_H_k[:, :, :kept_modes] = F.relu(
             0.5 * (
                 torch.einsum('...bi,bio->...bo', X_H_k[:, :, :kept_modes], self.w1[0]) - 
@@ -116,9 +97,11 @@ class AFNO2D(nn.Module):
             ) + self.b1[1]
         )
 
+        # Initialize second convolution tensors
         o2_H_k = torch.zeros(X_H_k.shape, device=x.device)
         o2_H_neg_k = torch.zeros(X_H_k.shape, device=x.device)
 
+        # Apply the second linear transformation
         o2_H_k[:, :, :kept_modes] = (
             0.5 * (
                 torch.einsum('...bi,bio->...bo', o1_H_k[:, :, :kept_modes], self.w2[0]) - 
@@ -137,12 +120,16 @@ class AFNO2D(nn.Module):
             ) + self.b2[1]
         )
 
+        # Combine positive and negative components
         x = o2_H_k + o2_H_neg_k
+
+        # Apply softshrink to enforce sparsity
         x = F.softshrink(x, lambd=self.sparsity_threshold)
-        x = idht2d(x)
+
+        # No inverse DHT needed as DHT is its own inverse
         x = x.reshape(B, D, H, W)
-        
-        return x
+
+        return x  # No need for residual addition since we aren't transforming back to the spatial domain
 
 class Block(nn.Module):
     def __init__(

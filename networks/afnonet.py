@@ -5,18 +5,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+import torch
+
 def dht2d(x: torch.Tensor) -> torch.Tensor:
     """
     Apply the 2D Discrete Hartley Transform (DHT) to a tensor `x`.
     The DHT retains the full frequency resolution, so the output will
     have the same shape as the input.
+    Input shape: (B, D, H, W)
+    Output shape: (B, D, H, W)
     """
-    # Ensure that the input tensor has 4 dimensions
     if x.ndim != 4:
         raise ValueError(f"Input tensor must be 4D, but got {x.ndim}D with shape {x.shape}.")
-
-    # Unpack dimensions as (Batch, Channels, Height, Width)
-    B, C, H, W = x.shape
+    
+    B, D, H, W = x.shape
 
     # Create the Hartley kernels for the row and column transforms
     m = torch.arange(H, device=x.device).float()
@@ -26,26 +28,32 @@ def dht2d(x: torch.Tensor) -> torch.Tensor:
     cas_row = torch.cos(2 * torch.pi * m.view(-1, 1) * m / H) + torch.sin(2 * torch.pi * m.view(-1, 1) * m / H)
     cas_col = torch.cos(2 * torch.pi * n.view(-1, 1) * n / W) + torch.sin(2 * torch.pi * n.view(-1, 1) * n / W)
 
+    # Ensure correct broadcasting for batch and channel dimensions
+    # Reshape x to handle DHT on 2D image (H x W) per batch/channel
+    x_reshaped = x.reshape(B * D, H, W)
+    
     # Perform the DHT in two steps: first along columns, then along rows
-    x_reshaped = x.reshape(B * C, H, W)  # Flatten batch and channels
     intermediate = torch.matmul(x_reshaped, cas_col)  # DHT on columns
     X = torch.matmul(cas_row, intermediate)  # DHT on rows
 
-    return X.reshape(B, C, H, W)  # Return to original shape
+    return X.reshape(B, D, H, W)  # Reshape back to original dimensions
 
 def idht2d(x: torch.Tensor) -> torch.Tensor:
     """
-    Apply the inverse 2D Discrete Hartley Transform (iDHT) to a tensor `x`.
-    This function uses the same DHT as the forward transform but divides
-    the result by the normalization factor (M * N).
+    Apply the inverse 2D Discrete Hartley Transform (IDHT) to a tensor `x`.
+    The IDHT should ideally recover the original signal. This is achieved by
+    applying the DHT again and normalizing by the image size.
+    Input shape: (B, D, H, W)
+    Output shape: (B, D, H, W)
     """
-    transformed = dht2d(x)  # Apply DHT for inverse
-
-    # Determine normalization factor based on the size of the image
-    B, C, H, W = x.size()
-    normalization_factor = H * W  # The product of the height and width
-
-    # Normalize the transformed result
+    # Apply DHT again to invert (Hartley transform is self-inverse)
+    transformed = dht2d(x)
+    
+    # Determine normalization factor
+    B, D, H, W = x.size()
+    normalization_factor = H * W
+    
+    # Normalize the transformed result by the number of pixels
     return transformed / normalization_factor
 
 class AFNO2D(nn.Module):
@@ -70,11 +78,12 @@ class AFNO2D(nn.Module):
         bias = x
 
         dtype = x.dtype
-        x = x.float()
+        x = x.float()  # Convert to float32 for processing
         B, H, W, C = x.shape
 
-        # Apply Discrete Hartley Transform (DHT) instead of FFT
+        # Apply the DHT instead of FFT
         x = dht2d(x)
+
         x = x.reshape(B, H, W, self.num_blocks, self.block_size)
 
         o1_real = torch.zeros([B, H, W, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
@@ -86,36 +95,42 @@ class AFNO2D(nn.Module):
         kept_modes = int(total_modes * self.hard_thresholding_fraction)
 
         o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0]) - \
-            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[1]) + \
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[0]) - \
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[1]) + \
             self.b1[0]
         )
 
         o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0]) + \
-            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[1]) + \
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[0]) + \
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[1]) + \
             self.b1[1]
         )
 
-        o2_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
+        o2_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]  = (
             torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) - \
             torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
             self.b2[0]
         )
 
-        o2_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
+        o2_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]  = (
             torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) + \
             torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
             self.b2[1]
         )
 
+        # Stack real and imaginary parts
         x = torch.stack([o2_real, o2_imag], dim=-1)
+
+        # Apply softshrink to impose sparsity
         x = F.softshrink(x, lambd=self.sparsity_threshold)
 
-        # Apply the inverse Discrete Hartley Transform (iDHT) instead of inverse FFT
-        x = idht2d(x)
+        # Combine back into complex form
+        x = torch.view_as_complex(x)
+
+        # Reshape and apply the inverse DHT
         x = x.reshape(B, H, W, C)
-        x = x.type(dtype)
+        x = idht2d(x)
+        x = x.type(dtype)  # Convert back to original data type
 
         return x + bias
 

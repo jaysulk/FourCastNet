@@ -143,7 +143,7 @@ class AFNO2D(nn.Module):
         x = o2_H_k + o2_H_neg_k
 
         # Apply softshrink to impose sparsity
-        x = F.softshrink(x, lambd=self.sparsity_threshold)
+        #x = F.softshrink(x, lambd=self.sparsity_threshold)
 
         # Reshape and apply the inverse DHT
         x = x.reshape(B, H, W, C)

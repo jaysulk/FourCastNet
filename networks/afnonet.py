@@ -14,10 +14,7 @@ def dht2d(x: torch.Tensor) -> torch.Tensor:
     have the same shape as the input.
     Input shape: (B, D, H, W)
     Output shape: (B, D, H, W)
-    """
-    if x.ndim != 4:
-        raise ValueError(f"Input tensor must be 4D, but got {x.ndim}D with shape {x.shape}.")
-    
+    """    
     B, D, H, W = x.shape
 
     # Create the Hartley kernels for the row and column transforms
@@ -142,9 +139,11 @@ class AFNO2D(nn.Module):
         # Combine positive and negative frequency components back
         x = o2_H_k + o2_H_neg_k
 
-        # Apply softshrink to impose sparsity
-        #x = F.softshrink(x, lambd=self.sparsity_threshold)
-
+        # Optional: Adjust or remove softshrink based on performance
+        if self.sparsity_threshold > 0:
+            # Adjust the threshold for softshrink or use an alternative method
+            x = F.softshrink(x, lambd=self.sparsity_threshold)  # You can reduce or adjust lambd here
+        
         # Reshape and apply the inverse DHT
         x = x.reshape(B, H, W, C)
         x = idht2d(x)

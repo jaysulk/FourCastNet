@@ -1,59 +1,48 @@
+#reference: https://github.com/NVlabs/AFNO-transformer
+
 import math
 from functools import partial
+from collections import OrderedDict
+from copy import Error, deepcopy
+from re import S
+from numpy.lib.arraypad import pad
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
+#from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+from timm.models.layers import DropPath, trunc_normal_
+import torch.fft
+from torch.nn.modules.container import Sequential
+from torch.utils.checkpoint import checkpoint_sequential
+from einops import rearrange, repeat
+from einops.layers.torch import Rearrange
+from utils.img_utils import PeriodicPad2d
 
-import torch
 
-def dht2d(x: torch.Tensor) -> torch.Tensor:
-    """
-    Apply the 2D Discrete Hartley Transform (DHT) to a tensor `x` using the FFT.
-    The DHT is related to the FFT by subtracting the imaginary part from the real part.
-    Input shape: (B, D, H, W)
-    Output shape: (B, D, H, W)
-    """
-    B, D, H, W = x.shape
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
 
-    # Apply the 2D real FFT
-    x_fft = torch.fft.rfft2(x, dim=(-2, -1), norm="ortho")
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
 
-    # Compute the DHT by subtracting the imaginary part from the real part
-    x_dht = x_fft.real - x_fft.imag
-
-    # rfft2 reduces the size of the last dimension, so we need to mirror the result
-    # to get the full shape back
-    # Append the mirrored part of x_dht along the last dimension to restore the size
-    if W % 2 == 0:
-        full_x_dht = torch.cat([x_dht, x_dht[:, :, :, 1:-1].flip(-1)], dim=-1)
-    else:
-        full_x_dht = torch.cat([x_dht, x_dht[:, :, :, 1:].flip(-1)], dim=-1)
-
-    return full_x_dht
-
-def idht2d(x: torch.Tensor) -> torch.Tensor:
-    """
-    Apply the inverse 2D Discrete Hartley Transform (IDHT) to a tensor `x` using the FFT.
-    Since the DHT is self-inverse, this is equivalent to applying the DHT again
-    and normalizing by the image size.
-    Input shape: (B, D, H, W)
-    Output shape: (B, D, H, W)
-    """
-    # Apply DHT again to invert (DHT is self-inverse)
-    transformed = dht2d(x)
-    
-    # Determine normalization factor
-    B, D, H, W = x.size()
-    normalization_factor = H * W
-    
-    # Normalize the transformed result by the number of pixels
-    return transformed / normalization_factor
 
 class AFNO2D(nn.Module):
     def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
         super().__init__()
-        assert hidden_size % num_blocks == 0, f"hidden_size {hidden_size} should be divisible by num_blocks {num_blocks}"
+        assert hidden_size % num_blocks == 0, f"hidden_size {hidden_size} should be divisble by num_blocks {num_blocks}"
 
         self.hidden_size = hidden_size
         self.sparsity_threshold = sparsity_threshold
@@ -63,7 +52,6 @@ class AFNO2D(nn.Module):
         self.hidden_size_factor = hidden_size_factor
         self.scale = 0.02
 
-        # Define weights and biases for the two linear transformation layers
         self.w1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size, self.block_size * self.hidden_size_factor))
         self.b1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor))
         self.w2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor, self.block_size))
@@ -71,67 +59,60 @@ class AFNO2D(nn.Module):
 
     def forward(self, x):
         bias = x
+
         dtype = x.dtype
         x = x.float()
         B, H, W, C = x.shape
 
-        # Step 1: Apply 2D DHT to the input
-        x_dht = dht2d(x)
+        x = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
+        x = x.real - x.imag
+        x =  torch.complex(x, torch.zeros_like(x))
+        x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
 
-        # Cast x_dht to a complex tensor
-        x_dht = torch.complex(x_dht, torch.zeros_like(x_dht))
-
-        # Reshape into blocks
-        x_dht = x_dht.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
-
-        # Prepare output tensors for the two layers of the network
         o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
         o1_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
-        o2_real = torch.zeros(x_dht.shape, device=x.device)
-        o2_imag = torch.zeros(x_dht.shape, device=x.device)
+        o2_real = torch.zeros(x.shape, device=x.device)
+        o2_imag = torch.zeros(x.shape, device=x.device)
 
-        # Define the mode ranges
+
         total_modes = H // 2 + 1
         kept_modes = int(total_modes * self.hard_thresholding_fraction)
 
-        # First linear transformation
         o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-            torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[0]) - \
-            torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[1]) + \
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[0]) - \
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[1]) + \
             self.b1[0]
         )
 
         o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-            torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[0]) + \
-            torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[1]) + \
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[0]) + \
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[1]) + \
             self.b1[1]
         )
 
-        # Second linear transformation
-        o2_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
+        o2_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]  = (
             torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) - \
             torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
             self.b2[0]
         )
 
-        o2_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
+        o2_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]  = (
             torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) + \
             torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
             self.b2[1]
         )
 
-        # Step 2: Stack real and imaginary parts and apply softshrink
         x = torch.stack([o2_real, o2_imag], dim=-1)
         x = F.softshrink(x, lambd=self.sparsity_threshold)
-
-        # Step 3: Convert back to complex and apply inverse FFT to return to the spatial domain
         x = torch.view_as_complex(x)
         x = x.reshape(B, H, W // 2 + 1, C)
-        x = idht2d(x)
-
-        # Step 4: Add bias (residual connection) and return the output
+        x = torch.fft.irfft2(x, s=(H, W), dim=(1,2), norm="ortho")
+        x = x.real - x.imag
+        x = torch.complex(x, torch.zeros_like(x))
         x = x.type(dtype)
+
         return x + bias
+
 
 class Block(nn.Module):
     def __init__(
@@ -150,7 +131,8 @@ class Block(nn.Module):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.filter = AFNO2D(dim, num_blocks, sparsity_threshold, hard_thresholding_fraction) 
-        self.drop_path = nn.Identity() if drop_path <= 0. else nn.Dropout(drop_path)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        #self.drop_path = nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
@@ -171,22 +153,23 @@ class Block(nn.Module):
         x = x + residual
         return x
 
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+class PrecipNet(nn.Module):
+    def __init__(self, params, backbone):
         super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
+        self.params = params
+        self.patch_size = (params.patch_size, params.patch_size)
+        self.in_chans = params.N_in_channels
+        self.out_chans = params.N_out_channels
+        self.backbone = backbone
+        self.ppad = PeriodicPad2d(1)
+        self.conv = nn.Conv2d(self.out_chans, self.out_chans, kernel_size=3, stride=1, padding=0, bias=True)
+        self.act = nn.ReLU()
 
     def forward(self, x):
-        x = self.fc1(x)
+        x = self.backbone(x)
+        x = self.ppad(x)
+        x = self.conv(x)
         x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
         return x
 
 class AFNONet(nn.Module):
@@ -234,19 +217,23 @@ class AFNONet(nn.Module):
 
         self.norm = norm_layer(embed_dim)
 
-        self.head = nn.Linear(embed_dim, self.out_chans * self.patch_size[0] * self.patch_size[1], bias=False)
+        self.head = nn.Linear(embed_dim, self.out_chans*self.patch_size[0]*self.patch_size[1], bias=False)
 
-        self._init_weights()
+        trunc_normal_(self.pos_embed, std=.02)
+        self.apply(self._init_weights)
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.zeros_(m.bias)
-                nn.init.ones_(m.weight)
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'pos_embed', 'cls_token'}
 
     def forward_features(self, x):
         B = x.shape[0]
@@ -273,8 +260,9 @@ class AFNONet(nn.Module):
         )
         return x
 
+
 class PatchEmbed(nn.Module):
-    def __init__(self, img_size=(720, 1440), patch_size=(16, 16), in_chans=2, embed_dim=768):
+    def __init__(self, img_size=(224, 224), patch_size=(16, 16), in_chans=3, embed_dim=768):
         super().__init__()
         num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
         self.img_size = img_size
@@ -290,8 +278,8 @@ class PatchEmbed(nn.Module):
 
 
 if __name__ == "__main__":
-    model = AFNONet(img_size=(720, 1440), patch_size=(4, 4), in_chans=20, out_chans=10)
-    sample = torch.randn(1, 20, 720, 1440)  # Shape: [B, D, H, W]
+    model = AFNONet(img_size=(720, 1440), patch_size=(4,4), in_chans=3, out_chans=10)
+    sample = torch.randn(1, 3, 720, 1440)
     result = model(sample)
     print(result.shape)
     print(torch.norm(result))

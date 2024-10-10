@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+import torch
+
 def dht2d(x: torch.Tensor) -> torch.Tensor:
     """
     Apply the 2D Discrete Hartley Transform (DHT) to a tensor `x` using the FFT.
@@ -23,7 +25,10 @@ def dht2d(x: torch.Tensor) -> torch.Tensor:
     # rfft2 reduces the size of the last dimension, so we need to mirror the result
     # to get the full shape back
     # Append the mirrored part of x_dht along the last dimension to restore the size
-    full_x_dht = torch.cat([x_dht, x_dht[:, :, :, 1:W//2].flip(-1)], dim=-1)
+    if W % 2 == 0:
+        full_x_dht = torch.cat([x_dht, x_dht[:, :, :, 1:-1].flip(-1)], dim=-1)
+    else:
+        full_x_dht = torch.cat([x_dht, x_dht[:, :, :, 1:].flip(-1)], dim=-1)
 
     return full_x_dht
 
@@ -35,7 +40,7 @@ def idht2d(x: torch.Tensor) -> torch.Tensor:
     Input shape: (B, D, H, W)
     Output shape: (B, D, H, W)
     """
-    # Apply DHT again to invert
+    # Apply DHT again to invert (DHT is self-inverse)
     transformed = dht2d(x)
     
     # Determine normalization factor
@@ -44,10 +49,6 @@ def idht2d(x: torch.Tensor) -> torch.Tensor:
     
     # Normalize the transformed result by the number of pixels
     return transformed / normalization_factor
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 class AFNO2D(nn.Module):
     def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):

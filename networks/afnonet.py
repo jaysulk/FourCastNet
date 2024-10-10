@@ -19,10 +19,8 @@ def dht2d(x: torch.Tensor):
 def idht2d(x):
     # Assume that dht2d is already defined for NumPy
     # Get the dimensions of X
-    dims = x.size()
-    n = torch.prod(torch.tensor(dims)).item()
-    dht = dht2d(x)
-    H = dht / n
+    fft= torch.fft.irfft2(x, s=(H, W), dim=(1,2), norm="ortho")
+    H = fft.real - fft.imag
     return H
 
 class AFNO2D(nn.Module):

@@ -5,48 +5,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-import torch
-
 def dht2d(x: torch.Tensor) -> torch.Tensor:
-    """
-    Apply the 2D Discrete Hartley Transform (DHT) to a tensor `x`.
-    The DHT retains the full frequency resolution, so the output will
-    have the same shape as the input.
-    Input shape: (B, D, H, W)
-    Output shape: (B, D, H, W)
-    """    
-    B, D, H, W = x.shape
 
-    # Create the Hartley kernels for the row and column transforms
-    m = torch.arange(H, device=x.device).float()
-    n = torch.arange(W, device=x.device).float()
+    x = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
+    x = x.real - x.imag
 
-    # Hartley kernels for rows and columns
-    cas_row = torch.cos(2 * torch.pi * m.view(-1, 1) * m / H) + torch.sin(2 * torch.pi * m.view(-1, 1) * m / H)
-    cas_col = torch.cos(2 * torch.pi * n.view(-1, 1) * n / W) + torch.sin(2 * torch.pi * n.view(-1, 1) * n / W)
-
-    # Ensure correct broadcasting for batch and channel dimensions
-    # Reshape x to handle DHT on 2D image (H x W) per batch/channel
-    x_reshaped = x.reshape(B * D, H, W)
-    
-    # Perform the DHT in two steps: first along columns, then along rows
-    intermediate = torch.matmul(x_reshaped, cas_col)  # DHT on columns
-    X = torch.matmul(cas_row, intermediate)  # DHT on rows
-
-    return X.reshape(B, D, H, W)  # Reshape back to original dimensions
+    return x
 
 def idht2d(x: torch.Tensor) -> torch.Tensor:
-    """
-    Apply the inverse 2D Discrete Hartley Transform (IDHT) to a tensor `x`.
-    The IDHT should ideally recover the original signal. This is achieved by
-    applying the DHT again and normalizing by the image size.
-    Input shape: (B, D, H, W)
-    Output shape: (B, D, H, W)
-    """
-    # Apply DHT again to invert (Hartley transform is self-inverse)
-    transformed = dht2d(x)
     
-    # Determine normalization factor
+    x = dht2d(x)
+    
     B, D, H, W = x.size()
     normalization_factor = H * W
     

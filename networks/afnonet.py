@@ -47,6 +47,10 @@ def idht2d(x: torch.Tensor) -> torch.Tensor:
     # Normalize the transformed result by the number of pixels
     return transformed / normalization_factor
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class AFNO2D(nn.Module):
     def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
         super().__init__()
@@ -68,81 +72,63 @@ class AFNO2D(nn.Module):
     def forward(self, x):
         bias = x
         dtype = x.dtype
-        x = x.float()  # Convert to float32 for processing
+        x = x.float()
         B, H, W, C = x.shape
 
-        # Apply the DHT instead of FFT
-        X_H_k = dht2d(x)  # DHT of x (positive frequency component)
-        X_H_neg_k = torch.roll(torch.flip(x, dims=[1, 2]), shifts=(1, 1), dims=[1, 2])  # Negative frequency component
+        # Step 1: Apply 2D FFT to the input
+        x_fft = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
+        x_dht = x_fft.real - x_fft.imag
 
-        block_size = self.block_size
-        hidden_size_factor = self.hidden_size_factor
+        # Reshape into blocks
+        x_dht = x_dht.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
 
-        # Ensure o1 and o2 dimensions match the expected sizes
-        o1_H_k = torch.zeros([B, H, W, self.num_blocks, self.block_size * hidden_size_factor], device=x.device)
-        o1_H_neg_k = torch.zeros([B, H, W, self.num_blocks, self.block_size * hidden_size_factor], device=x.device)
+        # Prepare output tensors for the two layers of the network
+        o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
+        o1_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
+        o2_real = torch.zeros(x_dht.shape, device=x.device)
+        o2_imag = torch.zeros(x_dht.shape, device=x.device)
 
+        # Define the mode ranges
         total_modes = H // 2 + 1
         kept_modes = int(total_modes * self.hard_thresholding_fraction)
 
-        # Reshape and align the dimensions of X_H_k and X_H_neg_k for broadcasting
-        X_H_k = X_H_k.reshape(B, H, W, self.num_blocks, block_size)
-        X_H_neg_k = X_H_neg_k.reshape(B, H, W, self.num_blocks, block_size)
-
-        # First multiplication for positive and negative frequency components
-        o1_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-            0.5 * (
-                torch.einsum('...bi,bio->...bo', X_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0]) -
-                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[1]) +
-                torch.einsum('...bi,bio->...bo', X_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[1]) +
-                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0])
-            ) + self.b1[0]
+        # First linear transformation
+        o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
+            torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[0]) - \
+            torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[1]) + \
+            self.b1[0]
         )
 
-        o1_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-            0.5 * (
-                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0]) -
-                torch.einsum('...bi,bio->...bo', X_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[1]) +
-                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[1]) +
-                torch.einsum('...bi,bio->...bo', X_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0])
-            ) + self.b1[1]
+        o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
+            torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[0]) + \
+            torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[1]) + \
+            self.b1[1]
         )
 
-        # Second multiplication for both positive and negative frequency components
-        o2_H_k = torch.zeros(X_H_k.shape, device=x.device)
-        o2_H_neg_k = torch.zeros(X_H_k.shape, device=x.device)
-
-        o2_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
-            0.5 * (
-                torch.einsum('...bi,bio->...bo', o1_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) -
-                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) +
-                torch.einsum('...bi,bio->...bo', o1_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) +
-                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0])
-            ) + self.b2[0]
+        # Second linear transformation
+        o2_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
+            torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) - \
+            torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
+            self.b2[0]
         )
 
-        o2_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
-            0.5 * (
-                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) -
-                torch.einsum('...bi,bio->...bo', o2_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) +
-                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) +
-                torch.einsum('...bi,bio->...bo', o2_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0])
-            ) + self.b2[1]
+        o2_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
+            torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) + \
+            torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
+            self.b2[1]
         )
 
-        # Combine positive and negative frequency components back
-        x = o2_H_k + o2_H_neg_k
+        # Step 2: Stack real and imaginary parts and apply softshrink
+        x = torch.stack([o2_real, o2_imag], dim=-1)
+        x = F.softshrink(x, lambd=self.sparsity_threshold)
 
-        # Optional: Adjust or remove softshrink based on performance
-        if self.sparsity_threshold > 0:
-            # Adjust the threshold for softshrink or use an alternative method
-            x = F.softshrink(x, lambd=self.sparsity_threshold)  # You can reduce or adjust lambd here
-        
-        # Reshape and apply the inverse DHT
-        x = x.reshape(B, H, W, C)
-        x = idht2d(x)
-        x = x.type(dtype)  # Convert back to original data type
+        # Step 3: Convert back to complex and apply inverse FFT to return to the spatial domain
+        x = torch.view_as_complex(x)
+        x = x.reshape(B, H, W // 2 + 1, C)
+        x = torch.fft.irfft2(x, s=(H, W), dim=(1, 2), norm="ortho")
 
+        # Step 4: Add bias (residual connection) and return the output
+        x = x.type(dtype)
         return x + bias
 
 class Block(nn.Module):

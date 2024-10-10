@@ -5,17 +5,42 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+import torch
+
 def dht2d(x: torch.Tensor) -> torch.Tensor:
+    """
+    Apply the 2D Discrete Hartley Transform (DHT) to a tensor `x` using the FFT.
+    The DHT is related to the FFT by subtracting the imaginary part from the real part.
+    Input shape: (B, D, H, W)
+    Output shape: (B, D, H, W)
+    """
+    B, D, H, W = x.shape
 
-    x = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
-    x = x.real - x.imag
+    # Apply the 2D real FFT
+    x_fft = torch.fft.rfft2(x, dim=(-2, -1), norm="ortho")
 
-    return x
+    # Compute the DHT by subtracting the imaginary part from the real part
+    x_dht = x_fft.real - x_fft.imag
+
+    # rfft2 reduces the size of the last dimension, so we need to mirror the result
+    # to get the full shape back
+    # Append the mirrored part of x_dht along the last dimension to restore the size
+    full_x_dht = torch.cat([x_dht, x_dht[:, :, :, 1:W//2].flip(-1)], dim=-1)
+
+    return full_x_dht
 
 def idht2d(x: torch.Tensor) -> torch.Tensor:
+    """
+    Apply the inverse 2D Discrete Hartley Transform (IDHT) to a tensor `x` using the FFT.
+    Since the DHT is self-inverse, this is equivalent to applying the DHT again
+    and normalizing by the image size.
+    Input shape: (B, D, H, W)
+    Output shape: (B, D, H, W)
+    """
+    # Apply DHT again to invert
+    transformed = dht2d(x)
     
-    x = dht2d(x)
-    
+    # Determine normalization factor
     B, D, H, W = x.size()
     normalization_factor = H * W
     

@@ -6,50 +6,52 @@ import torch.nn.functional as F
 from einops import rearrange
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
-def dht2d(x: torch.Tensor):
-    # Compute the 2D FFT
-    fft = torch.fft.fft2(x, dim=(-2, -1), norm="ortho")
+def dht2d(x: torch.Tensor) -> torch.Tensor:
+    """
+    Apply the 2D Discrete Hartley Transform (DHT) to a tensor `x`.
+    The DHT retains the full frequency resolution, so the output will
+    have the same shape as the input.
+    Input shape: (B, D, H, W)
+    Output shape: (B, D, H, W)
+    """    
+    B, D, H, W = x.shape
+
+    # Create the Hartley kernels for the row and column transforms
+    m = torch.arange(H, device=x.device).float()
+    n = torch.arange(W, device=x.device).float()
+
+    # Hartley kernels for rows and columns
+    cas_row = torch.cos(2 * torch.pi * m.view(-1, 1) * m / H) + torch.sin(2 * torch.pi * m.view(-1, 1) * m / H)
+    cas_col = torch.cos(2 * torch.pi * n.view(-1, 1) * n / W) + torch.sin(2 * torch.pi * n.view(-1, 1) * n / W)
+
+    # Ensure correct broadcasting for batch and channel dimensions
+    # Reshape x to handle DHT on 2D image (H x W) per batch/channel
+    x_reshaped = x.reshape(B * D, H, W)
     
-    # Calculate the Discrete Hartley Transform (DHT) using the real and imaginary parts of the FFT
-    H = fft.real - fft.imag
-    return H
+    # Perform the DHT in two steps: first along columns, then along rows
+    intermediate = torch.matmul(x_reshaped, cas_col)  # DHT on columns
+    X = torch.matmul(cas_row, intermediate)  # DHT on rows
 
-def idht2d(x: torch.Tensor, H: int, W: int):
-    # Perform the inverse DHT by applying the inverse FFT
-    # Combine the real and imaginary parts for reconstruction
-    real_part = x
-    imag_part = torch.zeros_like(x)  # No imaginary part in DHT, but still required for FFT
-    complex_x = torch.complex(real_part, imag_part)
+    return X.reshape(B, D, H, W)  # Reshape back to original dimensions
 
-    # Apply inverse FFT to reconstruct the original input
-    x_reconstructed = torch.fft.ifft2(complex_x, s=(H, W), norm="ortho")
-    return x_reconstructed.real
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-def dht2d(x: torch.Tensor):
-    # Compute the 2D FFT
-    fft = torch.fft.fft2(x, dim=(-2, -1), norm="ortho")
+def idht2d(x: torch.Tensor) -> torch.Tensor:
+    """
+    Apply the inverse 2D Discrete Hartley Transform (IDHT) to a tensor `x`.
+    The IDHT should ideally recover the original signal. This is achieved by
+    applying the DHT again and normalizing by the image size.
+    Input shape: (B, D, H, W)
+    Output shape: (B, D, H, W)
+    """
+    # Apply DHT again to invert (Hartley transform is self-inverse)
+    transformed = dht2d(x)
     
-    # Calculate the Discrete Hartley Transform (DHT) using the real and imaginary parts of the FFT
-    H = fft.real - fft.imag
-    return H
-
-def idht2d(x: torch.Tensor, H: int, W: int):
-    # Perform the inverse DHT by applying the inverse FFT
-    # Combine the real and imaginary parts for reconstruction
-    real_part = x
-    imag_part = torch.zeros_like(x)  # No imaginary part in DHT, but still required for FFT
-    complex_x = torch.complex(real_part, imag_part)
-
-    # Apply inverse FFT to reconstruct the original input
-    x_reconstructed = torch.fft.ifft2(complex_x, s=(H, W), norm="ortho")
-    return x_reconstructed.real
+    # Determine normalization factor
+    B, D, H, W = x.size()
+    normalization_factor = H * W
+    
+    # Normalize the transformed result by the number of pixels
+    return transformed / normalization_factor
 
 class AFNO2D(nn.Module):
     def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
@@ -76,45 +78,78 @@ class AFNO2D(nn.Module):
         B, H, W, C = x.shape
 
         # Apply the DHT instead of FFT
-        X_H_k = dht2d(x)  # DHT of x (real-valued transform)
+        X_H_k = dht2d(x)  # DHT of x (positive frequency component)
+        X_H_neg_k = torch.roll(torch.flip(x, dims=[1, 2]), shifts=(1, 1), dims=[1, 2])  # Negative frequency component
 
         block_size = self.block_size
         hidden_size_factor = self.hidden_size_factor
 
-        # Ensure o1 dimensions match the expected sizes
-        o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * hidden_size_factor], device=x.device)
+        # Ensure o1 and o2 dimensions match the expected sizes
+        o1_H_k = torch.zeros([B, H, W, self.num_blocks, self.block_size * hidden_size_factor], device=x.device)
+        o1_H_neg_k = torch.zeros([B, H, W, self.num_blocks, self.block_size * hidden_size_factor], device=x.device)
 
         total_modes = H // 2 + 1
         kept_modes = int(total_modes * self.hard_thresholding_fraction)
 
-        # Reshape and align the dimensions of X_H_k for broadcasting
-        X_H_k = X_H_k.reshape(B, H, W // 2 + 1, self.num_blocks, block_size)
+        # Reshape and align the dimensions of X_H_k and X_H_neg_k for broadcasting
+        X_H_k = X_H_k.reshape(B, H, W, self.num_blocks, block_size)
+        X_H_neg_k = X_H_neg_k.reshape(B, H, W, self.num_blocks, block_size)
 
-        # First multiplication for the real part
-        o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-            torch.einsum('...bi,bio->...bo', X_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0]) +
-            self.b1[0]
+        # First multiplication for positive and negative frequency components
+        o1_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
+            0.5 * (
+                torch.einsum('...bi,bio->...bo', X_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0]) -
+                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[1]) +
+                torch.einsum('...bi,bio->...bo', X_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[1]) +
+                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0])
+            ) + self.b1[0]
         )
 
-        # Second multiplication for the real part
-        o2_real = torch.zeros_like(o1_real)
-        o2_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
-            torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) +
-            self.b2[0]
+        o1_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
+            0.5 * (
+                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0]) -
+                torch.einsum('...bi,bio->...bo', X_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[1]) +
+                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[1]) +
+                torch.einsum('...bi,bio->...bo', X_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0])
+            ) + self.b1[1]
         )
 
-        # Since DHT has only real parts, no imaginary part handling is necessary.
-        x = F.softshrink(o2_real, lambd=self.sparsity_threshold)
+        # Second multiplication for both positive and negative frequency components
+        o2_H_k = torch.zeros(X_H_k.shape, device=x.device)
+        o2_H_neg_k = torch.zeros(X_H_k.shape, device=x.device)
 
-        # Reshape back to the original shape
-        x = x.reshape(B, H, W // 2 + 1, C)
+        o2_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
+            0.5 * (
+                torch.einsum('...bi,bio->...bo', o1_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) -
+                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) +
+                torch.einsum('...bi,bio->...bo', o1_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) +
+                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0])
+            ) + self.b2[0]
+        )
 
-        # Compute the inverse DHT to reconstruct the original input
-        x = idht2d(x, H, W)
-        x = x.type(dtype)  # Convert back to the original data type
+        o2_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
+            0.5 * (
+                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) -
+                torch.einsum('...bi,bio->...bo', o2_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) +
+                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) +
+                torch.einsum('...bi,bio->...bo', o2_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0])
+            ) + self.b2[1]
+        )
+
+        # Combine positive and negative frequency components back
+        x = o2_H_k + o2_H_neg_k
+
+        # Optional: Adjust or remove softshrink based on performance
+        if self.sparsity_threshold > 0:
+            # Adjust the threshold for softshrink or use an alternative method
+            x = F.softshrink(x, lambd=self.sparsity_threshold)  # You can reduce or adjust lambd here
+        
+        # Reshape and apply the inverse DHT
+        x = x.reshape(B, H, W, C)
+        x = idht2d(x)
+        x = x.type(dtype)  # Convert back to original data type
 
         return x + bias
-
 
 class Block(nn.Module):
     def __init__(

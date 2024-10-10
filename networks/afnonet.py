@@ -5,8 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-import torch
-
 def dht2d(x: torch.Tensor) -> torch.Tensor:
     """
     Apply the 2D Discrete Hartley Transform (DHT) to a tensor `x` using the FFT.
@@ -64,6 +62,7 @@ class AFNO2D(nn.Module):
         self.hidden_size_factor = hidden_size_factor
         self.scale = 0.02
 
+        # Define weights and biases for the two linear transformation layers
         self.w1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size, self.block_size * self.hidden_size_factor))
         self.b1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor))
         self.w2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor, self.block_size))
@@ -75,9 +74,11 @@ class AFNO2D(nn.Module):
         x = x.float()
         B, H, W, C = x.shape
 
-        # Step 1: Apply 2D FFT to the input
-        x_fft = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
-        x_dht = x_fft.real - x_fft.imag
+        # Step 1: Apply 2D DHT to the input
+        x_dht = dht2d(x)
+
+        # Cast x_dht to a complex tensor
+        x_dht = torch.complex(x_dht, torch.zeros_like(x_dht))
 
         # Reshape into blocks
         x_dht = x_dht.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
@@ -95,12 +96,12 @@ class AFNO2D(nn.Module):
         # First linear transformation
         o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
             torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[0]) - \
-            torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[1]) + \
+            torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[1]) + \
             self.b1[0]
         )
 
         o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-            torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[0]) + \
+            torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[0]) + \
             torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[1]) + \
             self.b1[1]
         )
@@ -125,7 +126,7 @@ class AFNO2D(nn.Module):
         # Step 3: Convert back to complex and apply inverse FFT to return to the spatial domain
         x = torch.view_as_complex(x)
         x = x.reshape(B, H, W // 2 + 1, C)
-        x = torch.fft.irfft2(x, s=(H, W), dim=(1, 2), norm="ortho")
+        x = idht2d(x)
 
         # Step 4: Add bias (residual connection) and return the output
         x = x.type(dtype)

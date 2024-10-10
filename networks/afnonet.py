@@ -5,28 +5,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-import torch
-
 def dht2d(x: torch.Tensor):
     # Compute the 2D FFT
-    fft = torch.fft.fft2(x, dim=(1, 2), norm="ortho")
-
+    fft = torch.fft.fft2(x, dim=(-2, -1), norm="ortho")
+    
     # Calculate the Discrete Hartley Transform using the real and imaginary parts of the FFT
     H = fft.real - fft.imag
-
     return H
 
-def idht2d(x):
-    # Assume that dht2d is already defined for NumPy
-    # Get the dimensions of X
-    fft= torch.fft.irfft2(x, s=(H, W), dim=(1,2), norm="ortho")
-    H = fft.real - fft.imag
-    return H
+def idht2d(x: torch.Tensor, H: int, W: int):
+    # Perform inverse 2D DHT by using inverse FFT
+    # We combine the real and imaginary components to reconstruct the original signal
+    # using the FFT's inverse, which should match the original DHT calculation
+    complex_x = torch.view_as_complex(torch.stack([x.real, x.imag], dim=-1))
+    x_reconstructed = torch.fft.ifft2(complex_x, s=(H, W), norm="ortho")
+    return x_reconstructed.real
 
 class AFNO2D(nn.Module):
     def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
         super().__init__()
-        assert hidden_size % num_blocks == 0, f"hidden_size {hidden_size} should be divisble by num_blocks {num_blocks}"
+        assert hidden_size % num_blocks == 0, f"hidden_size {hidden_size} should be divisible by num_blocks {num_blocks}"
 
         self.hidden_size = hidden_size
         self.sparsity_threshold = sparsity_threshold
@@ -43,23 +41,25 @@ class AFNO2D(nn.Module):
 
     def forward(self, x):
         bias = x
-
         dtype = x.dtype
         x = x.float()
         B, H, W, C = x.shape
 
+        # Compute DHT
         x = dht2d(x)
+        
+        # Reshape to account for the blocks
         x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
 
         o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
         o1_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
-        o2_real = torch.zeros(x.shape, device=x.device)
-        o2_imag = torch.zeros(x.shape, device=x.device)
-
+        o2_real = torch.zeros_like(o1_real)
+        o2_imag = torch.zeros_like(o1_imag)
 
         total_modes = H // 2 + 1
         kept_modes = int(total_modes * self.hard_thresholding_fraction)
 
+        # Process real and imaginary parts
         o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
             torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[0]) - \
             torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[1]) + \
@@ -87,8 +87,12 @@ class AFNO2D(nn.Module):
         x = torch.stack([o2_real, o2_imag], dim=-1)
         x = F.softshrink(x, lambd=self.sparsity_threshold)
         x = torch.view_as_complex(x)
+        
+        # Reshape back to the original shape
         x = x.reshape(B, H, W // 2 + 1, C)
-        x = idht2d(x)
+
+        # Compute the inverse DHT
+        x = idht2d(x, H, W)
         x = x.type(dtype)
 
         return x + bias

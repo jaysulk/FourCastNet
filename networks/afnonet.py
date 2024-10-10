@@ -64,10 +64,10 @@ class AFNO2D(nn.Module):
         self.hidden_size_factor = hidden_size_factor
         self.scale = 0.02
 
-        self.w1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size, self.block_size * self.hidden_size_factor))
-        self.b1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor))
-        self.w2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor, self.block_size))
-        self.b2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size))
+        self.w1 = nn.Parameter(self.scale * torch.randn(self.num_blocks, self.block_size, self.block_size * self.hidden_size_factor))
+        self.b1 = nn.Parameter(self.scale * torch.randn(self.num_blocks, self.block_size * self.hidden_size_factor))
+        self.w2 = nn.Parameter(self.scale * torch.randn(self.num_blocks, self.block_size * self.hidden_size_factor, self.block_size))
+        self.b2 = nn.Parameter(self.scale * torch.randn(self.num_blocks, self.block_size))
 
     def forward(self, x):
         bias = x
@@ -75,55 +75,35 @@ class AFNO2D(nn.Module):
         x = x.float()
         B, H, W, C = x.shape
 
-        # Step 1: Apply 2D FFT to the input
+        # Step 1: Apply 2D FFT to the input and calculate DHT (real - imag)
         x_fft = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
         x_dht = x_fft.real - x_fft.imag
 
         # Reshape into blocks
         x_dht = x_dht.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
 
-        # Prepare output tensors for the two layers of the network
+        # Prepare the output tensor for the first layer of the network
         o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
-        o1_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
-        o2_real = torch.zeros(x_dht.shape, device=x.device)
-        o2_imag = torch.zeros(x_dht.shape, device=x.device)
 
         # Define the mode ranges
         total_modes = H // 2 + 1
         kept_modes = int(total_modes * self.hard_thresholding_fraction)
 
-        # First linear transformation
+        # First linear transformation (no need for imaginary part handling)
         o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-            torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[0]) - \
-            torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[1]) + \
-            self.b1[0]
+            torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1) + self.b1
         )
 
-        o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-            torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[0]) + \
-            torch.einsum('...bi,bio->...bo', x_dht[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[1]) + \
-            self.b1[1]
-        )
-
-        # Second linear transformation
+        # Second linear transformation (using o1_real only)
+        o2_real = torch.zeros_like(x_dht, device=x.device)
         o2_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
-            torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) - \
-            torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
-            self.b2[0]
+            torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2) + self.b2
         )
 
-        o2_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
-            torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) + \
-            torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
-            self.b2[1]
-        )
+        # Step 2: Apply softshrink to the result
+        x = F.softshrink(o2_real, lambd=self.sparsity_threshold)
 
-        # Step 2: Stack real and imaginary parts and apply softshrink
-        x = torch.stack([o2_real, o2_imag], dim=-1)
-        x = F.softshrink(x, lambd=self.sparsity_threshold)
-
-        # Step 3: Convert back to complex and apply inverse FFT to return to the spatial domain
-        x = torch.view_as_complex(x)
+        # Step 3: Convert back to full spatial domain using inverse FFT
         x = x.reshape(B, H, W // 2 + 1, C)
         x = torch.fft.irfft2(x, s=(H, W), dim=(1, 2), norm="ortho")
 

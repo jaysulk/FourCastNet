@@ -5,21 +5,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 def dht2d(x: torch.Tensor):
     # Compute the 2D FFT
     fft = torch.fft.fft2(x, dim=(-2, -1), norm="ortho")
     
-    # Calculate the Discrete Hartley Transform using the real and imaginary parts of the FFT
+    # Calculate the Discrete Hartley Transform by subtracting the imaginary part from the real part
     H = fft.real - fft.imag
     return H
 
 def idht2d(x: torch.Tensor, H: int, W: int):
-    # Perform inverse 2D DHT by using inverse FFT
-    # We combine the real and imaginary components to reconstruct the original signal
-    # using the FFT's inverse, which should match the original DHT calculation
-    complex_x = torch.view_as_complex(torch.stack([x.real, x.imag], dim=-1))
-    x_reconstructed = torch.fft.ifft2(complex_x, s=(H, W), norm="ortho")
-    return x_reconstructed.real
+    # Reconstruct using the inverse Hartley transform, which is equivalent to the original DHT
+    fft = torch.fft.rfft2(x, s=(H, W), dim=(-2, -1), norm="ortho")
+    
+    # Reconstruct real values (inverse Hartley transform)
+    x_reconstructed = fft.real + fft.imag
+    return x_reconstructed
 
 class AFNO2D(nn.Module):
     def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
@@ -52,41 +56,23 @@ class AFNO2D(nn.Module):
         x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
 
         o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
-        o1_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
         o2_real = torch.zeros_like(o1_real)
-        o2_imag = torch.zeros_like(o1_imag)
 
         total_modes = H // 2 + 1
         kept_modes = int(total_modes * self.hard_thresholding_fraction)
 
-        # Process real and imaginary parts
+        # Process real part (since DHT is real-valued)
         o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[0]) - \
-            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[1]) + \
-            self.b1[0]
-        )
-
-        o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[0]) + \
-            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[1]) + \
-            self.b1[1]
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0]) + self.b1[0]
         )
 
         o2_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]  = (
-            torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) - \
-            torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
+            torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) + \
             self.b2[0]
         )
 
-        o2_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]  = (
-            torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) + \
-            torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
-            self.b2[1]
-        )
-
-        x = torch.stack([o2_real, o2_imag], dim=-1)
-        x = F.softshrink(x, lambd=self.sparsity_threshold)
-        x = torch.view_as_complex(x)
+        # Since DHT has only real parts, we don't need to handle imaginary components here.
+        x = F.softshrink(o2_real, lambd=self.sparsity_threshold)
         
         # Reshape back to the original shape
         x = x.reshape(B, H, W // 2 + 1, C)

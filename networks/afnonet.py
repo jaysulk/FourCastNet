@@ -107,8 +107,6 @@ class AFNO2D(nn.Module):
         x = torch.view_as_complex(x)
         x = x.reshape(B, H, W // 2 + 1, C)
         x = torch.fft.irfft2(x, s=(H, W), dim=(1,2), norm="ortho")
-        x = x.real - x.imag
-        x = torch.complex(x, torch.zeros_like(x))
         x = x.type(dtype)
 
         return x + bias

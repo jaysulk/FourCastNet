@@ -51,9 +51,20 @@ class AFNO2D(nn.Module):
 
         # Compute DHT
         x = dht2d(x)
+
+        # Check the number of elements before reshaping
+        num_elements_before = x.numel()
         
         # Reshape to account for the blocks
-        x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
+        reshaped_size = (B, H, W // 2 + 1, self.num_blocks, self.block_size)
+
+        # Validate the reshape is possible
+        expected_elements = B * H * (W // 2 + 1) * self.num_blocks * self.block_size
+        if num_elements_before != expected_elements:
+            raise RuntimeError(f"Cannot reshape tensor with {num_elements_before} elements to {reshaped_size} with {expected_elements} elements.")
+
+        # Reshape tensor
+        x = x.reshape(*reshaped_size)
 
         o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
         o2_real = torch.zeros_like(o1_real)

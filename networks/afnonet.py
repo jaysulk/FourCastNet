@@ -13,17 +13,20 @@ def dht2d(x: torch.Tensor):
     # Compute the 2D FFT
     fft = torch.fft.fft2(x, dim=(-2, -1), norm="ortho")
     
-    # Calculate the Discrete Hartley Transform by subtracting the imaginary part from the real part
+    # Calculate the Discrete Hartley Transform (DHT) using the real and imaginary parts of the FFT
     H = fft.real - fft.imag
     return H
 
 def idht2d(x: torch.Tensor, H: int, W: int):
-    # Reconstruct using the inverse Hartley transform, which is equivalent to the original DHT
-    fft = torch.fft.rfft2(x, s=(H, W), dim=(-2, -1), norm="ortho")
-    
-    # Reconstruct real values (inverse Hartley transform)
-    x_reconstructed = fft.real + fft.imag
-    return x_reconstructed
+    # Perform the inverse DHT by applying the inverse FFT
+    # Combine the real and imaginary parts for reconstruction
+    real_part = x
+    imag_part = torch.zeros_like(x)  # No imaginary part in DHT, but still required for FFT
+    complex_x = torch.complex(real_part, imag_part)
+
+    # Apply inverse FFT to reconstruct the original input
+    x_reconstructed = torch.fft.ifft2(complex_x, s=(H, W), norm="ortho")
+    return x_reconstructed.real
 
 class AFNO2D(nn.Module):
     def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
@@ -49,30 +52,26 @@ class AFNO2D(nn.Module):
         x = x.float()
         B, H, W, C = x.shape
 
-        # Compute DHT
+        # Compute the DHT (Hartley Transform)
         x = dht2d(x)
 
-        # Check the number of elements before reshaping
+        # Reshape to account for the blocks
         num_elements_before = x.numel()
         
-        # Reshape to account for the blocks
+        # Expected reshape size based on blocks
         reshaped_size = (B, H, W // 2 + 1, self.num_blocks, self.block_size)
-
-        # Validate the reshape is possible
         expected_elements = B * H * (W // 2 + 1) * self.num_blocks * self.block_size
-        if num_elements_before != expected_elements:
-            raise RuntimeError(f"Cannot reshape tensor with {num_elements_before} elements to {reshaped_size} with {expected_elements} elements.")
 
         # Reshape tensor
         x = x.reshape(*reshaped_size)
-
+      
         o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
         o2_real = torch.zeros_like(o1_real)
 
         total_modes = H // 2 + 1
         kept_modes = int(total_modes * self.hard_thresholding_fraction)
 
-        # Process real part (since DHT is real-valued)
+        # Process the real part (since DHT is real-valued)
         o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
             torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0]) + self.b1[0]
         )
@@ -88,7 +87,7 @@ class AFNO2D(nn.Module):
         # Reshape back to the original shape
         x = x.reshape(B, H, W // 2 + 1, C)
 
-        # Compute the inverse DHT
+        # Compute the inverse DHT to reconstruct the original input
         x = idht2d(x, H, W)
         x = x.type(dtype)
 

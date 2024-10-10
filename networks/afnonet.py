@@ -28,6 +28,29 @@ def idht2d(x: torch.Tensor, H: int, W: int):
     x_reconstructed = torch.fft.ifft2(complex_x, s=(H, W), norm="ortho")
     return x_reconstructed.real
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def dht2d(x: torch.Tensor):
+    # Compute the 2D FFT
+    fft = torch.fft.fft2(x, dim=(-2, -1), norm="ortho")
+    
+    # Calculate the Discrete Hartley Transform (DHT) using the real and imaginary parts of the FFT
+    H = fft.real - fft.imag
+    return H
+
+def idht2d(x: torch.Tensor, H: int, W: int):
+    # Perform the inverse DHT by applying the inverse FFT
+    # Combine the real and imaginary parts for reconstruction
+    real_part = x
+    imag_part = torch.zeros_like(x)  # No imaginary part in DHT, but still required for FFT
+    complex_x = torch.complex(real_part, imag_part)
+
+    # Apply inverse FFT to reconstruct the original input
+    x_reconstructed = torch.fft.ifft2(complex_x, s=(H, W), norm="ortho")
+    return x_reconstructed.real
+
 class AFNO2D(nn.Module):
     def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
         super().__init__()
@@ -49,49 +72,49 @@ class AFNO2D(nn.Module):
     def forward(self, x):
         bias = x
         dtype = x.dtype
-        x = x.float()
+        x = x.float()  # Convert to float32 for processing
         B, H, W, C = x.shape
 
-        # Compute the DHT (Hartley Transform)
-        x = dht2d(x)
+        # Apply the DHT instead of FFT
+        X_H_k = dht2d(x)  # DHT of x (real-valued transform)
 
-        # Reshape to account for the blocks
-        num_elements_before = x.numel()
-        
-        # Expected reshape size based on blocks
-        reshaped_size = (B, H, W // 2 + 1, self.num_blocks, self.block_size)
-        expected_elements = B * H * (W // 2 + 1) * self.num_blocks * self.block_size
+        block_size = self.block_size
+        hidden_size_factor = self.hidden_size_factor
 
-        # Reshape tensor
-        x = x.reshape(*reshaped_size)
-      
-        o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
-        o2_real = torch.zeros_like(o1_real)
+        # Ensure o1 dimensions match the expected sizes
+        o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * hidden_size_factor], device=x.device)
 
         total_modes = H // 2 + 1
         kept_modes = int(total_modes * self.hard_thresholding_fraction)
 
-        # Process the real part (since DHT is real-valued)
+        # Reshape and align the dimensions of X_H_k for broadcasting
+        X_H_k = X_H_k.reshape(B, H, W // 2 + 1, self.num_blocks, block_size)
+
+        # First multiplication for the real part
         o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0]) + self.b1[0]
+            torch.einsum('...bi,bio->...bo', X_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0]) +
+            self.b1[0]
         )
 
-        o2_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]  = (
-            torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) + \
+        # Second multiplication for the real part
+        o2_real = torch.zeros_like(o1_real)
+        o2_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
+            torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) +
             self.b2[0]
         )
 
-        # Since DHT has only real parts, we don't need to handle imaginary components here.
+        # Since DHT has only real parts, no imaginary part handling is necessary.
         x = F.softshrink(o2_real, lambd=self.sparsity_threshold)
-        
+
         # Reshape back to the original shape
         x = x.reshape(B, H, W // 2 + 1, C)
 
         # Compute the inverse DHT to reconstruct the original input
         x = idht2d(x, H, W)
-        x = x.type(dtype)
+        x = x.type(dtype)  # Convert back to the original data type
 
         return x + bias
+
 
 class Block(nn.Module):
     def __init__(

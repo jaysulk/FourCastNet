@@ -64,7 +64,7 @@ class AFNO2D(nn.Module):
         x = x.float()
         B, H, W, C = x.shape
 
-        x = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
+        x = torch.fft.fft2(x, dim=(1, 2), norm="ortho")
         x = x.real - x.imag
         x =  torch.complex(x, torch.zeros_like(x))
         x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
@@ -106,7 +106,7 @@ class AFNO2D(nn.Module):
         x = F.softshrink(x, lambd=self.sparsity_threshold)
         x = torch.view_as_complex(x)
         x = x.reshape(B, H, W // 2 + 1, C)
-        x = torch.fft.irfft2(x, dim=(1, 2), norm="ortho")/(H * W)
+        x = torch.fft.ifft2(x, dim=(1, 2), norm="ortho")/(H * W)
         x = x.type(dtype)
 
         return x + bias

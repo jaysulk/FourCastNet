@@ -106,7 +106,11 @@ class AFNO2D(nn.Module):
             x = torch.stack([o2_real, o2_imag], dim=-1)
             x = F.softshrink(x, lambd=self.sparsity_threshold)
             x = torch.view_as_complex(x)
-            x = x.reshape(B, H, W // 2 + 1, C)
+
+            # Make sure the shape after view_as_complex is consistent with the expected shape
+            x = x.reshape(B, H, W // 2 + 1, self.num_blocks * self.block_size)
+
+            # Inverse FFT
             x = torch.fft.irfft2(x, s=(H, W), dim=(1, 2), norm="ortho")
             x = x + bias  # von Neumann update
 

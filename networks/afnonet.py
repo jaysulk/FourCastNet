@@ -77,7 +77,7 @@ class AFNO2D(nn.Module):
         B, H, W, C = x.shape
     
         # Use DHT instead of rfft2
-        X_H_k = self.dht2d(x)  # DHT of x (positive frequency component)
+        X_H_k = self.dht2(x)  # DHT of x (positive frequency component)
         X_H_neg_k = torch.roll(torch.flip(x, dims=[1, 2]), shifts=(1, 1), dims=[1, 2])  # Negative frequency component
     
         # Reshape if needed, depending on how self.dht2d(x) returns

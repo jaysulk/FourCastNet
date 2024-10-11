@@ -64,7 +64,7 @@ class AFNO2D(nn.Module):
         x = x.float()
         B, H, W, C = x.shape
 
-        # Apply RFFT to input
+        # Apply RFFT to input and reshape to expected dimensions
         x = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
         x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
 
@@ -77,7 +77,10 @@ class AFNO2D(nn.Module):
             o2_real = torch.zeros(x.shape, device=x.device)
             o2_imag = torch.zeros(x.shape, device=x.device)
 
-            # Applying the linear layers in Fourier space
+            # Ensure dimensions are correct before einsum operation
+            assert x.shape[-1] == self.block_size, f"Input size {x.shape[-1]} does not match block size {self.block_size}"
+            
+            # Apply linear transformations in Fourier space
             o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
                 torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[0]) - \
                 torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[1]) + \
@@ -106,15 +109,18 @@ class AFNO2D(nn.Module):
             x = F.softshrink(x, lambd=self.sparsity_threshold)
             x = torch.view_as_complex(x)
 
-            # Reshape back and perform the inverse FFT
-            x = x.reshape(B, H, W // 2 + 1, C)
-            x = torch.fft.irfft2(x, s=(H, W), dim=(1,2), norm="ortho")
-            x = x.type(dtype)
+            # Reshape back to ensure consistency for next iteration
+            x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
 
             # Add the residual (previous state)
             x = x + bias
 
-        return x
+        # Final inverse FFT and reshape to original size
+        x = x.reshape(B, H, W // 2 + 1, C)
+        x = torch.fft.irfft2(x, s=(H, W), dim=(1, 2), norm="ortho")
+        x = x.type(dtype)
+
+        return x + bias
 
 
 class Block(nn.Module):

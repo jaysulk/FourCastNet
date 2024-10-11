@@ -113,7 +113,6 @@ class AFNO2D(nn.Module):
         x = x.type(dtype)
         return x
 
-
 class Block(nn.Module):
     def __init__(
             self,
@@ -126,22 +125,23 @@ class Block(nn.Module):
             double_skip=True,
             num_blocks=8,
             sparsity_threshold=0.01,
-            hard_thresholding_fraction=1.0
+            hard_thresholding_fraction=1.0,
+            iterations=3  # Add iterations for von Neumann updates
         ):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.filter = AFNO2D(dim, num_blocks, sparsity_threshold, hard_thresholding_fraction) 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        #self.drop_path = nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         self.double_skip = double_skip
+        self.iterations = iterations  # Number of von Neumann iterations
 
     def forward(self, x):
         residual = x
         x = self.norm1(x)
-        x = self.filter(x)
+        x = self.filter(x, iterations=self.iterations)  # Apply von Neumann iterative update
 
         if self.double_skip:
             x = x + residual

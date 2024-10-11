@@ -89,31 +89,30 @@ class AFNO2D(nn.Module):
         for _ in range(self.iterations):
             # Apply the operator in frequency space and perform the von Neumann update
             # Fix einsum dimensions, ensuring the sizes align
-            o1_real[:, :, :kept_modes] = F.relu(
-                torch.einsum('...bi,bio->...bo', x_fft[:, :, :kept_modes].real, self.w1[0]) - \
-                torch.einsum('...bi,bio->...bo', x_fft[:, :, :kept_modes].imag, self.w1[1]) + \
-                self.b1[0]
-            )
-
-            o1_imag[:, :, :kept_modes] = F.relu(
-                torch.einsum('...bi,bio->...bo', x_fft[:, :, :kept_modes].imag, self.w1[0]) + \
-                torch.einsum('...bi,bio->...bo', x_fft[:, :, :kept_modes].real, self.w1[1]) + \
-                self.b1[1]
-            )
-
-            # Compute second step of the operator
-            o2_real[:, :, :kept_modes]  = (
-                torch.einsum('...bi,bio->...bo', o1_real[:, :, :kept_modes], self.w2[0]) - \
-                torch.einsum('...bi,bio->...bo', o1_imag[:, :, :kept_modes], self.w2[1]) + \
-                self.b2[0]
-            )
-
-            o2_imag[:, :, :kept_modes]  = (
-                torch.einsum('...bi,bio->...bo', o1_imag[:, :, :kept_modes], self.w2[0]) + \
-                torch.einsum('...bi,bio->...bo', o1_real[:, :, :kept_modes], self.w2[1]) + \
-                self.b2[1]
-            )
-
+        o1_real[:, :, :kept_modes] = F.relu(
+            torch.einsum('bhfbi,bio->bhfbo', x_fft[:, :, :kept_modes].real, self.w1[0]) - \
+            torch.einsum('bhfbi,bio->bhfbo', x_fft[:, :, :kept_modes].imag, self.w1[1]) + \
+            self.b1[0]
+        )
+        
+        o1_imag[:, :, :kept_modes] = F.relu(
+            torch.einsum('bhfbi,bio->bhfbo', x_fft[:, :, :kept_modes].imag, self.w1[0]) + \
+            torch.einsum('bhfbi,bio->bhfbo', x_fft[:, :, :kept_modes].real, self.w1[1]) + \
+            self.b1[1]
+        )
+        
+        # ... similarly for o2_real and o2_imag
+        o2_real[:, :, :kept_modes]  = (
+            torch.einsum('bhfbo,bio->bhfbi', o1_real[:, :, :kept_modes], self.w2[0]) - \
+            torch.einsum('bhfbo,bio->bhfbi', o1_imag[:, :, :kept_modes], self.w2[1]) + \
+            self.b2[0]
+        )
+        
+        o2_imag[:, :, :kept_modes]  = (
+            torch.einsum('bhfbo,bio->bhfbi', o1_imag[:, :, :kept_modes], self.w2[0]) + \
+            torch.einsum('bhfbo,bio->bhfbi', o1_real[:, :, :kept_modes], self.w2[1]) + \
+            self.b2[1]
+        )
             # Combine real and imaginary parts
             x_fft = torch.stack([o2_real, o2_imag], dim=-1)
             x_fft = F.softshrink(x_fft, lambd=self.sparsity_threshold)
@@ -130,12 +129,6 @@ class AFNO2D(nn.Module):
         # Ensure the output shape matches the original input shape (B, H, W, C)
         assert x.shape == (B, H, W, C), f"Output shape {x.shape} does not match input shape {(B, H, W, C)}"
         return x
-
-# Test the model with input of shape [5, 10, 15, 20]
-input_tensor = torch.randn(5, 10, 15, 20)  # [Batch, Height, Width, Channels]
-model = AFNO2D(hidden_size=20, num_blocks=8, iterations=3)
-output = model(input_tensor)
-print(output.shape)
 
 class Block(nn.Module):
     def __init__(

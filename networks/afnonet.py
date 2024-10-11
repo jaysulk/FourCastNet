@@ -90,10 +90,8 @@ class AFNO2D(nn.Module):
         X1 = x_h[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]
         X2 = self.w1[0]
     
-        # Adjust the shapes to ensure they match for element-wise multiplication
-        if X1.shape != X2.shape:
-            # You might need to reshape X2 or broadcast both X1 and X2 to the same shape
-            X2 = X2.view(1, 1, 1, X2.shape[-2], X2.shape[-1])  # Example reshaping
+        # Ensure X1 and X2 are broadcastable by adjusting X2's shape dynamically
+        X2 = X2.view(1, 1, *X2.shape) if X2.dim() < X1.dim() else X2
     
         # Hartley convolution terms
         X1_pos = X1
@@ -118,6 +116,7 @@ class AFNO2D(nn.Module):
         x = x.type(dtype)
     
         return x + bias
+
 
 class Block(nn.Module):
     def __init__(

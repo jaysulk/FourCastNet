@@ -40,7 +40,7 @@ class Mlp(nn.Module):
 
 
 class AFNO2D(nn.Module):
-    def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
+    def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1, num_iterations=5):
         super().__init__()
         assert hidden_size % num_blocks == 0, f"hidden_size {hidden_size} should be divisible by num_blocks {num_blocks}"
 
@@ -51,71 +51,71 @@ class AFNO2D(nn.Module):
         self.hard_thresholding_fraction = hard_thresholding_fraction
         self.hidden_size_factor = hidden_size_factor
         self.scale = 0.02
+        self.num_iterations = num_iterations  # Number of iterations for von Neumann update
 
         self.w1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size, self.block_size * self.hidden_size_factor))
         self.b1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor))
         self.w2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor, self.block_size))
         self.b2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size))
 
-    def forward(self, x, iterations=3):
-        """
-        Apply the von Neumann iterative scheme in forward pass.
-        :param x: input tensor of shape [B, H, W, C]
-        :param iterations: number of von Neumann iterations
-        """
-        bias = x  # Keep initial input as bias for von Neumann iterations
-
+    def forward(self, x):
+        bias = x  # Preserve input for the residual connection
         dtype = x.dtype
         x = x.float()
         B, H, W, C = x.shape
 
-        # Apply Fourier transform
+        # Apply RFFT to input
         x = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
         x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
 
-        # Initialize real and imaginary parts
-        o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
-        o1_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
+        total_modes = H // 2 + 1
+        kept_modes = int(total_modes * self.hard_thresholding_fraction)
 
-        # Iterative von Neumann update
-        for _ in range(iterations):
-            # Apply the transformation and accumulate
-            total_modes = H // 2 + 1
-            kept_modes = int(total_modes * self.hard_thresholding_fraction)
+        for _ in range(self.num_iterations):  # Iterative von Neumann update
+            o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
+            o1_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
+            o2_real = torch.zeros(x.shape, device=x.device)
+            o2_imag = torch.zeros(x.shape, device=x.device)
 
+            # Applying the linear layers in Fourier space
             o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-                torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[0]) -
-                torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[1]) +
+                torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[0]) - \
+                torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[1]) + \
                 self.b1[0]
             )
+
             o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-                torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[0]) +
-                torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[1]) +
+                torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[0]) + \
+                torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[1]) + \
                 self.b1[1]
             )
 
-            # Add the bias (von Neumann iterative update)
-            o2_real = torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) - \
-                      torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
-                      self.b2[0]
-            o2_imag = torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) + \
-                      torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
-                      self.b2[1]
+            o2_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]  = (
+                torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) - \
+                torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
+                self.b2[0]
+            )
 
-            # Re-apply Fourier and update bias (iterative update)
+            o2_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]  = (
+                torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) + \
+                torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
+                self.b2[1]
+            )
+
             x = torch.stack([o2_real, o2_imag], dim=-1)
             x = F.softshrink(x, lambd=self.sparsity_threshold)
             x = torch.view_as_complex(x)
 
-            # Make sure the shape after view_as_complex is consistent with the expected shape
-            x = x.reshape(B, H, W // 2 + 1, self.num_blocks * self.block_size)
+            # Reshape back and perform the inverse FFT
+            x = x.reshape(B, H, W // 2 + 1, C)
+            x = torch.fft.irfft2(x, s=(H, W), dim=(1,2), norm="ortho")
+            x = x.type(dtype)
 
-            # Inverse FFT
-            x = torch.fft.irfft2(x, s=(H, W), dim=(1, 2), norm="ortho")
-            x = x + bias  # von Neumann update
+            # Add the residual (previous state)
+            x = x + bias
 
-        x = x.type(dtype)
         return x
+
 
 class Block(nn.Module):
     def __init__(

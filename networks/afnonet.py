@@ -89,7 +89,12 @@ class AFNO2D(nn.Module):
         # Apply the learned linear transformations and activation
         X1 = x_h[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]
         X2 = self.w1[0]
-        
+    
+        # Adjust the shapes to ensure they match for element-wise multiplication
+        if X1.shape != X2.shape:
+            # You might need to reshape X2 or broadcast both X1 and X2 to the same shape
+            X2 = X2.view(1, 1, 1, X2.shape[-2], X2.shape[-1])  # Example reshaping
+    
         # Hartley convolution terms
         X1_pos = X1
         X1_neg = torch.roll(X1, shifts=-1, dims=1)  # Roll to get -k
@@ -113,7 +118,6 @@ class AFNO2D(nn.Module):
         x = x.type(dtype)
     
         return x + bias
-
 
 class Block(nn.Module):
     def __init__(

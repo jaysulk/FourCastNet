@@ -51,9 +51,9 @@ class AFNO2D(nn.Module):
         self.hard_thresholding_fraction = hard_thresholding_fraction
         self.hidden_size_factor = hidden_size_factor
         self.scale = 0.02
-        self.iterations = iterations  # Number of iterations for the von Neumann operator
+        self.iterations = iterations  # Number of von Neumann iterations
 
-        # Initialize parameters for Fourier layers
+        # Initialize weight and bias parameters for Fourier layer transformations
         self.w1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size, self.block_size * self.hidden_size_factor))
         self.b1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor))
         self.w2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor, self.block_size))
@@ -65,72 +65,77 @@ class AFNO2D(nn.Module):
         dtype = x.dtype
         x = x.float()  # Cast x to float32
         B, H, W, C = x.shape  # Save the input shape [5, 10, 15, 20]
-    
+
         # Perform FFT to go to frequency space
         x_fft = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
-    
+
         # Reshape: Break the number of channels C into blocks and block size
         assert C % self.num_blocks == 0, "C must be divisible by num_blocks"
         block_size = C // self.num_blocks  # Dynamically calculate block size
-    
+
         # Reshape x_fft to match the number of blocks and block size
         x_fft = x_fft.reshape(B, H, W // 2 + 1, self.num_blocks, block_size)
-    
+
         # Initialize output tensors for real and imaginary parts
         o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, block_size * self.hidden_size_factor], device=x.device)
         o1_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, block_size * self.hidden_size_factor], device=x.device)
         o2_real = torch.zeros(x_fft.shape, device=x.device)
         o2_imag = torch.zeros(x_fft.shape, device=x.device)
-    
-        total_modes = H // 2 + 1
+
+        total_modes = W // 2 + 1  # Fix the total modes for the width (W) dimension
         kept_modes = int(total_modes * self.hard_thresholding_fraction)
-    
+
         # Iterate through the von Neumann iterations
         for _ in range(self.iterations):
             # Apply the operator in frequency space and perform the von Neumann update
             # Fix einsum dimensions, ensuring the sizes align
-    
-            o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-                torch.einsum('...bi,bio->...bo', x_fft[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[0]) - \
-                torch.einsum('...bi,bio->...bo', x_fft[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[1]) + \
+            o1_real[:, :, :kept_modes] = F.relu(
+                torch.einsum('...bi,bio->...bo', x_fft[:, :, :kept_modes].real, self.w1[0]) - \
+                torch.einsum('...bi,bio->...bo', x_fft[:, :, :kept_modes].imag, self.w1[1]) + \
                 self.b1[0]
             )
-    
-            o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-                torch.einsum('...bi,bio->...bo', x_fft[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[0]) + \
-                torch.einsum('...bi,bio->...bo', x_fft[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[1]) + \
+
+            o1_imag[:, :, :kept_modes] = F.relu(
+                torch.einsum('...bi,bio->...bo', x_fft[:, :, :kept_modes].imag, self.w1[0]) + \
+                torch.einsum('...bi,bio->...bo', x_fft[:, :, :kept_modes].real, self.w1[1]) + \
                 self.b1[1]
             )
-    
+
             # Compute second step of the operator
-            o2_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]  = (
-                torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) - \
-                torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
+            o2_real[:, :, :kept_modes]  = (
+                torch.einsum('...bi,bio->...bo', o1_real[:, :, :kept_modes], self.w2[0]) - \
+                torch.einsum('...bi,bio->...bo', o1_imag[:, :, :kept_modes], self.w2[1]) + \
                 self.b2[0]
             )
-    
-            o2_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]  = (
-                torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) + \
-                torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
+
+            o2_imag[:, :, :kept_modes]  = (
+                torch.einsum('...bi,bio->...bo', o1_imag[:, :, :kept_modes], self.w2[0]) + \
+                torch.einsum('...bi,bio->...bo', o1_real[:, :, :kept_modes], self.w2[1]) + \
                 self.b2[1]
             )
-    
+
             # Combine real and imaginary parts
             x_fft = torch.stack([o2_real, o2_imag], dim=-1)
             x_fft = F.softshrink(x_fft, lambd=self.sparsity_threshold)
             x_fft = torch.view_as_complex(x_fft)
-    
+
             # Reshape and inverse FFT
             x_fft = x_fft.reshape(B, H, W // 2 + 1, C)
             x = torch.fft.irfft2(x_fft, s=(H, W), dim=(1, 2), norm="ortho")
             x = x.type(dtype)
-    
+
             # Update using the von Neumann iterative scheme
             x = x + bias  # Adding back the previous state (von Neumann operator update)
-    
+
         # Ensure the output shape matches the original input shape (B, H, W, C)
         assert x.shape == (B, H, W, C), f"Output shape {x.shape} does not match input shape {(B, H, W, C)}"
         return x
+
+# Test the model with input of shape [5, 10, 15, 20]
+input_tensor = torch.randn(5, 10, 15, 20)  # [Batch, Height, Width, Channels]
+model = AFNO2D(hidden_size=20, num_blocks=8, iterations=3)
+output = model(input_tensor)
+print(output.shape)
 
 class Block(nn.Module):
     def __init__(

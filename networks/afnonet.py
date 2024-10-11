@@ -67,6 +67,11 @@ class AFNO2D(nn.Module):
         # Perform the inverse 2D Hartley Transform using inverse FFT
         fft_x = torch.fft.ifft2(x, dim=(1, 2), norm="ortho")
         idht_x = fft_x.real - fft_x.imag  # IDHT relationship with IFFT
+        
+        # Normalize by the number of elements in the transformed dimensions (H * W)
+        H, W = x.shape[1:3]  # Assuming x is (B, H, W, ...)
+        idht_x = idht_x * (H * W)
+        
         return idht_x
 
     def forward(self, x):

@@ -77,29 +77,27 @@ class AFNO2D(nn.Module):
         B, H, W, C = x.shape
     
         # Use DHT instead of rfft2
-        x_h = self.dht2(x)
-        x_h = x_h.reshape(B, H, W, self.num_blocks, self.block_size)
+        X_H_k = self.dht2d(x)  # DHT of x (positive frequency component)
+        X_H_neg_k = torch.roll(torch.flip(x, dims=[1, 2]), shifts=(1, 1), dims=[1, 2])  # Negative frequency component
+    
+        # Reshape if needed, depending on how self.dht2d(x) returns
+        X_H_k = X_H_k.reshape(B, H, W, self.num_blocks, self.block_size)
+        X_H_neg_k = X_H_neg_k.reshape(B, H, W, self.num_blocks, self.block_size)
     
         o1 = torch.zeros([B, H, W, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
-        o2 = torch.zeros(x_h.shape, device=x.device)
+        o2 = torch.zeros(X_H_k.shape, device=x.device)
     
         total_modes = H // 2 + 1
         kept_modes = int(total_modes * self.hard_thresholding_fraction)
     
-        # Apply the learned linear transformations and activation
-        X1 = x_h[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]
-        X2 = self.w1[0]
-        
-        # Hartley convolution terms
-        X1_pos = X1
-        X1_neg = torch.roll(X1, shifts=-1, dims=1)  # Roll to get -k
-        X2_pos = X2
-        X2_neg = torch.roll(X2, shifts=-1, dims=1)
+        # Apply the Hartley convolution formula using positive and negative components
+        X1_pos = X_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]
+        X1_neg = X_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]
     
-        # Applying the Hartley convolution formula
+        # Hartley convolution terms
         conv_hartley = 0.5 * (
-            X1_pos * X2_pos - X1_neg * X2_neg +
-            X1_pos * X2_neg + X1_neg * X2_pos
+            X1_pos * X1_pos - X1_neg * X1_neg +
+            X1_pos * X1_neg + X1_neg * X1_pos
         )
     
         o1[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(conv_hartley + self.b1[0])
@@ -113,8 +111,6 @@ class AFNO2D(nn.Module):
         x = x.type(dtype)
     
         return x + bias
-
-
 
 class Block(nn.Module):
     def __init__(

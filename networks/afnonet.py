@@ -57,6 +57,18 @@ class AFNO2D(nn.Module):
         self.w2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor, self.block_size))
         self.b2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size))
 
+    def dht2(self, x):
+        # Perform the 2D Hartley Transform using FFT
+        fft_x = torch.fft.fft2(x, dim=(1, 2), norm="ortho")
+        dht_x = fft_x.real - fft_x.imag  # DHT relationship with FFT
+        return dht_x
+
+    def idht2(self, x):
+        # Perform the inverse 2D Hartley Transform using inverse FFT
+        fft_x = torch.fft.ifft2(x, dim=(1, 2), norm="ortho")
+        idht_x = fft_x.real - fft_x.imag  # IDHT relationship with IFFT
+        return idht_x
+
     def forward(self, x):
         bias = x
 
@@ -64,51 +76,30 @@ class AFNO2D(nn.Module):
         x = x.float()
         B, H, W, C = x.shape
 
-        x = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
-        x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
+        # Use DHT instead of rfft2
+        x = self.dht2(x)
+        x = x.reshape(B, H, W, self.num_blocks, self.block_size)
 
-        o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
-        o1_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
-        o2_real = torch.zeros(x.shape, device=x.device)
-        o2_imag = torch.zeros(x.shape, device=x.device)
-
+        o1 = torch.zeros([B, H, W, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
+        o2 = torch.zeros(x.shape, device=x.device)
 
         total_modes = H // 2 + 1
         kept_modes = int(total_modes * self.hard_thresholding_fraction)
 
-        o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[0]) - \
-            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[1]) + \
-            self.b1[0]
+        # Apply the learned linear transformations and activation
+        o1[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0]) + self.b1[0]
         )
 
-        o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[0]) + \
-            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[1]) + \
-            self.b1[1]
+        o2[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
+            torch.einsum('...bi,bio->...bo', o1[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) + self.b2[0]
         )
 
-        o2_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]  = (
-            torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) - \
-            torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
-            self.b2[0]
-        )
-
-        o2_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]  = (
-            torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) + \
-            torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
-            self.b2[1]
-        )
-
-        x = torch.stack([o2_real, o2_imag], dim=-1)
-        x = F.softshrink(x, lambd=self.sparsity_threshold)
-        x = torch.view_as_complex(x)
-        x = x.reshape(B, H, W // 2 + 1, C)
-        x = torch.fft.irfft2(x, s=(H, W), dim=(1,2), norm="ortho")
+        # Use inverse DHT instead of irfft2
+        x = self.idht2(o2.reshape(B, H, W, C))
         x = x.type(dtype)
 
         return x + bias
-
 
 class Block(nn.Module):
     def __init__(

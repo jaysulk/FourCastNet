@@ -85,35 +85,34 @@ class AFNO2D(nn.Module):
         kept_modes = int(total_modes * self.hard_thresholding_fraction)
 
         for _ in range(self.iterations):
-            # Correct einsum subscripts to avoid repeated letters
+            
             # Real part einsum operation
             o1_real[:, :, :kept_modes] = F.relu(
-                torch.einsum('bhwoc,cijo->bhwjo', x_fft[:, :, :kept_modes].real, self.w1[0]) - \
-                torch.einsum('bhwoc,cijo->bhwjo', x_fft[:, :, :kept_modes].imag, self.w1[1]) + \
+                torch.einsum('...ic,cijo->...jo', x_fft[:, :, :kept_modes].real, self.w1[0]) - \
+                torch.einsum('...ic,cijo->...jo', x_fft[:, :, :kept_modes].imag, self.w1[1]) + \
                 self.b1[0]
             )
             
             # Imaginary part einsum operation
             o1_imag[:, :, :kept_modes] = F.relu(
-                torch.einsum('bhwoc,cijo->bhwjo', x_fft[:, :, :kept_modes].imag, self.w1[0]) + \
-                torch.einsum('bhwoc,cijo->bhwjo', x_fft[:, :, :kept_modes].real, self.w1[1]) + \
+                torch.einsum('...ic,cijo->...jo', x_fft[:, :, :kept_modes].imag, self.w1[0]) + \
+                torch.einsum('...ic,cijo->...jo', x_fft[:, :, :kept_modes].real, self.w1[1]) + \
                 self.b1[1]
             )
             
             # Real part einsum operation for o2
             o2_real[:, :, :kept_modes] = (
-                torch.einsum('bhwjo,cijo->bhwoc', o1_real[:, :, :kept_modes], self.w2[0]) - \
-                torch.einsum('bhwjo,cijo->bhwoc', o1_imag[:, :, :kept_modes], self.w2[1]) + \
+                torch.einsum('...jo,cijo->...ic', o1_real[:, :, :kept_modes], self.w2[0]) - \
+                torch.einsum('...jo,cijo->...ic', o1_imag[:, :, :kept_modes], self.w2[1]) + \
                 self.b2[0]
             )
             
             # Imaginary part einsum operation for o2
             o2_imag[:, :, :kept_modes] = (
-                torch.einsum('bhwjo,cijo->bhwoc', o1_imag[:, :, :kept_modes], self.w2[0]) + \
-                torch.einsum('bhwjo,cijo->bhwoc', o1_real[:, :, :kept_modes], self.w2[1]) + \
+                torch.einsum('...jo,cijo->...ic', o1_imag[:, :, :kept_modes], self.w2[0]) + \
+                torch.einsum('...jo,cijo->...ic', o1_real[:, :, :kept_modes], self.w2[1]) + \
                 self.b2[1]
             )
-
 
             x_fft = torch.stack([o2_real, o2_imag], dim=-1)
             x_fft = F.softshrink(x_fft, lambd=self.sparsity_threshold)

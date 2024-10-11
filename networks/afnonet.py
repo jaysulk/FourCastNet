@@ -64,17 +64,17 @@ class AFNO2D(nn.Module):
         bias = x
         dtype = x.dtype
         x = x.float()
-        B, H, W, C = x.shape
+        B, H, W, C = x.shape  # Save the input shape for later
 
         # Perform FFT to go to frequency space
-        x = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
-        x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
+        x_fft = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
+        x_fft = x_fft.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
 
-        # Initialize output tensors
+        # Initialize output tensors for real and imaginary parts
         o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
         o1_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
-        o2_real = torch.zeros(x.shape, device=x.device)
-        o2_imag = torch.zeros(x.shape, device=x.device)
+        o2_real = torch.zeros(x_fft.shape, device=x.device)
+        o2_imag = torch.zeros(x_fft.shape, device=x.device)
 
         total_modes = H // 2 + 1
         kept_modes = int(total_modes * self.hard_thresholding_fraction)
@@ -83,14 +83,14 @@ class AFNO2D(nn.Module):
         for _ in range(self.iterations):
             # Apply the operator in frequency space and perform the von Neumann update
             o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-                torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[0]) - \
-                torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[1]) + \
+                torch.einsum('...bi,bio->...bo', x_fft[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[0]) - \
+                torch.einsum('...bi,bio->...bo', x_fft[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[1]) + \
                 self.b1[0]
             )
 
             o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
-                torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[0]) + \
-                torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[1]) + \
+                torch.einsum('...bi,bio->...bo', x_fft[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[0]) + \
+                torch.einsum('...bi,bio->...bo', x_fft[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[1]) + \
                 self.b1[1]
             )
 
@@ -108,18 +108,20 @@ class AFNO2D(nn.Module):
             )
 
             # Combine real and imaginary parts
-            x = torch.stack([o2_real, o2_imag], dim=-1)
-            x = F.softshrink(x, lambd=self.sparsity_threshold)
-            x = torch.view_as_complex(x)
+            x_fft = torch.stack([o2_real, o2_imag], dim=-1)
+            x_fft = F.softshrink(x_fft, lambd=self.sparsity_threshold)
+            x_fft = torch.view_as_complex(x_fft)
 
             # Reshape and inverse FFT
-            x = x.reshape(B, H, W // 2 + 1, C)
-            x = torch.fft.irfft2(x, s=(H, W), dim=(1, 2), norm="ortho")
+            x_fft = x_fft.reshape(B, H, W // 2 + 1, C)
+            x = torch.fft.irfft2(x_fft, s=(H, W), dim=(1, 2), norm="ortho")
             x = x.type(dtype)
 
             # Update using the von Neumann iterative scheme
             x = x + bias  # Adding back the previous state (von Neumann operator update)
 
+        # Ensure the output shape matches the original input shape (B, H, W, C)
+        assert x.shape == (B, H, W, C), f"Output shape {x.shape} does not match input shape {(B, H, W, C)}"
         return x
 
 

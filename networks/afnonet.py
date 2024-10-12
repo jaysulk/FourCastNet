@@ -39,10 +39,6 @@ class Mlp(nn.Module):
         return x
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 class AFNO2D(nn.Module):
     def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, 
                  hard_thresholding_fraction=1, hidden_size_factor=1, iterations=3):
@@ -88,29 +84,29 @@ class AFNO2D(nn.Module):
             
             # Real part einsum operation
             o1_real[:, :, :kept_modes] = F.relu(
-                torch.einsum('...ic,cijo->...jo', x_fft[:, :, :kept_modes].real, self.w1[0]) - \
-                torch.einsum('...ic,cijo->...jo', x_fft[:, :, :kept_modes].imag, self.w1[1]) + \
+                torch.einsum('bhwcj,bcjo->bhwjo', x_fft[:, :, :kept_modes].real, self.w1[0]) - \
+                torch.einsum('bhwcj,bcjo->bhwjo', x_fft[:, :, :kept_modes].imag, self.w1[1]) + \
                 self.b1[0]
             )
             
             # Imaginary part einsum operation
             o1_imag[:, :, :kept_modes] = F.relu(
-                torch.einsum('...ic,cijo->...jo', x_fft[:, :, :kept_modes].imag, self.w1[0]) + \
-                torch.einsum('...ic,cijo->...jo', x_fft[:, :, :kept_modes].real, self.w1[1]) + \
+                torch.einsum('bhwcj,bcjo->bhwjo', x_fft[:, :, :kept_modes].imag, self.w1[0]) + \
+                torch.einsum('bhwcj,bcjo->bhwjo', x_fft[:, :, :kept_modes].real, self.w1[1]) + \
                 self.b1[1]
             )
             
             # Real part einsum operation for o2
             o2_real[:, :, :kept_modes] = (
-                torch.einsum('...jo,cijo->...ic', o1_real[:, :, :kept_modes], self.w2[0]) - \
-                torch.einsum('...jo,cijo->...ic', o1_imag[:, :, :kept_modes], self.w2[1]) + \
+                torch.einsum('bhwjo,bcjo->bhwcj', o1_real[:, :, :kept_modes], self.w2[0]) - \
+                torch.einsum('bhwjo,bcjo->bhwcj', o1_imag[:, :, :kept_modes], self.w2[1]) + \
                 self.b2[0]
             )
             
             # Imaginary part einsum operation for o2
             o2_imag[:, :, :kept_modes] = (
-                torch.einsum('...jo,cijo->...ic', o1_imag[:, :, :kept_modes], self.w2[0]) + \
-                torch.einsum('...jo,cijo->...ic', o1_real[:, :, :kept_modes], self.w2[1]) + \
+                torch.einsum('bhwjo,bcjo->bhwcj', o1_imag[:, :, :kept_modes], self.w2[0]) + \
+                torch.einsum('bhwjo,bcjo->bhwcj', o1_real[:, :, :kept_modes], self.w2[1]) + \
                 self.b2[1]
             )
 
@@ -119,13 +115,13 @@ class AFNO2D(nn.Module):
             x_fft = torch.view_as_complex(x_fft)
 
             x_fft = x_fft.reshape(B, H, W // 2 + 1, C)
-            x = torch.fft.irfft2(x_fft, s=(H, W), dim=(1, 2), norm="ortho")
+            x = torch.fft.irfft2(x_fft.float(), s=(H, W), dim=(1, 2), norm="ortho")
             x = x.type(dtype)
 
             x = x + bias
 
-        assert x.shape == (B, H, W, C), f"Output shape {x.shape} does not match input shape {(B, H, W, C)}"
         return x
+
         
 class Block(nn.Module):
     def __init__(

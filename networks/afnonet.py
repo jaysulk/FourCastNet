@@ -72,8 +72,8 @@ class AFNO2D(nn.Module):
 
         o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, block_size * self.hidden_size_factor], device=x.device)
         o1_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, block_size * self.hidden_size_factor], device=x.device)
-        o2_real = torch.zeros(x_fft.shape, device=x.device)
-        o2_imag = torch.zeros(x_fft.shape, device=x.device)
+        o2_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, block_size], device=x.device)
+        o2_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, block_size], device=x.device)
 
         total_modes = W // 2 + 1
         kept_modes = int(total_modes * self.hard_thresholding_fraction)
@@ -82,32 +82,33 @@ class AFNO2D(nn.Module):
             
             # Real part einsum operation
             o1_real[:, :, :kept_modes] = F.relu(
-                torch.einsum('bhwfc,bcij->bhwfj', x_fft[:, :, :kept_modes].real, self.w1[0]) - \
-                torch.einsum('bhwfc,bcij->bhwfj', x_fft[:, :, :kept_modes].imag, self.w1[1]) + \
-                self.b1[0]
+                torch.einsum('bhkci,cij->bhkcj', x_fft[:, :, :kept_modes].real, self.w1[0]) - \
+                torch.einsum('bhkci,cij->bhkcj', x_fft[:, :, :kept_modes].imag, self.w1[1]) + \
+                self.b1[0].unsqueeze(0).unsqueeze(0).unsqueeze(0)
             )
             
             # Imaginary part einsum operation
             o1_imag[:, :, :kept_modes] = F.relu(
-                torch.einsum('bhwfc,bcij->bhwfj', x_fft[:, :, :kept_modes].imag, self.w1[0]) + \
-                torch.einsum('bhwfc,bcij->bhwfj', x_fft[:, :, :kept_modes].real, self.w1[1]) + \
-                self.b1[1]
+                torch.einsum('bhkci,cij->bhkcj', x_fft[:, :, :kept_modes].imag, self.w1[0]) + \
+                torch.einsum('bhkci,cij->bhkcj', x_fft[:, :, :kept_modes].real, self.w1[1]) + \
+                self.b1[1].unsqueeze(0).unsqueeze(0).unsqueeze(0)
             )
             
             # Real part einsum operation for o2
             o2_real[:, :, :kept_modes] = (
-                torch.einsum('bhwfj,bcij->bhwfc', o1_real[:, :, :kept_modes], self.w2[0]) - \
-                torch.einsum('bhwfj,bcij->bhwfc', o1_imag[:, :, :kept_modes], self.w2[1]) + \
-                self.b2[0]
+                torch.einsum('bhkcj,cjm->bhkci', o1_real[:, :, :kept_modes], self.w2[0]) - \
+                torch.einsum('bhkcj,cjm->bhkci', o1_imag[:, :, :kept_modes], self.w2[1]) + \
+                self.b2[0].unsqueeze(0).unsqueeze(0).unsqueeze(0)
             )
             
             # Imaginary part einsum operation for o2
             o2_imag[:, :, :kept_modes] = (
-                torch.einsum('bhwfj,bcij->bhwfc', o1_imag[:, :, :kept_modes], self.w2[0]) + \
-                torch.einsum('bhwfj,bcij->bhwfc', o1_real[:, :, :kept_modes], self.w2[1]) + \
-                self.b2[1]
+                torch.einsum('bhkcj,cjm->bhkci', o1_imag[:, :, :kept_modes], self.w2[0]) + \
+                torch.einsum('bhkcj,cjm->bhkci', o1_real[:, :, :kept_modes], self.w2[1]) + \
+                self.b2[1].unsqueeze(0).unsqueeze(0).unsqueeze(0)
             )
 
+            # Combine real and imaginary parts
             x_fft = torch.stack([o2_real, o2_imag], dim=-1)
             x_fft = F.softshrink(x_fft, lambd=self.sparsity_threshold)
             x_fft = torch.view_as_complex(x_fft)
@@ -117,7 +118,7 @@ class AFNO2D(nn.Module):
             x = x.type(dtype)
 
             x = x + bias
-
+            
         return x
 
 class Block(nn.Module):

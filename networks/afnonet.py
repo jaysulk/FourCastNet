@@ -1,5 +1,3 @@
-#reference: https://github.com/NVlabs/AFNO-transformer
-
 import math
 from functools import partial
 from collections import OrderedDict
@@ -10,14 +8,25 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-#from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+# from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers import DropPath, trunc_normal_
 import torch.fft
 from torch.nn.modules.container import Sequential
 from torch.utils.checkpoint import checkpoint_sequential
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
-from utils.img_utils import PeriodicPad2d
+# from utils.img_utils import PeriodicPad2d
+
+
+class PeriodicPad2d(nn.Module):
+    def __init__(self, pad_size):
+        super().__init__()
+        self.pad_size = pad_size
+
+    def forward(self, x):
+        pad_size = self.pad_size
+        return F.pad(x, (pad_size, pad_size, pad_size, pad_size), mode='circular')
+
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -36,14 +45,10 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         x = self.drop(x)
         return x
-        
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
 
 class AFNO2D(nn.Module):
-    def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, 
-                 hard_thresholding_fraction=1, hidden_size_factor=1, iterations=3):
+    def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1, max_iter=10, tol=1e-6):
         super().__init__()
         assert hidden_size % num_blocks == 0, f"hidden_size {hidden_size} should be divisible by num_blocks {num_blocks}"
 
@@ -54,74 +59,73 @@ class AFNO2D(nn.Module):
         self.hard_thresholding_fraction = hard_thresholding_fraction
         self.hidden_size_factor = hidden_size_factor
         self.scale = 0.02
-        self.iterations = iterations
 
         self.w1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size, self.block_size * self.hidden_size_factor))
         self.b1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor))
         self.w2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor, self.block_size))
         self.b2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size))
+        self.max_iter = max_iter
+        self.tol = tol
+
+    def apply_filter(self, x):
+        dtype = x.dtype
+        x = x.float()
+        B, H, W, C = x.shape
+
+        x = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
+        x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
+
+        o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
+        o1_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
+        o2_real = torch.zeros(x.shape, device=x.device)
+        o2_imag = torch.zeros(x.shape, device=x.device)
+
+        total_modes = H // 2 + 1
+        kept_modes = int(total_modes * self.hard_thresholding_fraction)
+
+        o1_real[:, total_modes-kept_modes:total_modes, :kept_modes] = F.relu(
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes, :kept_modes].real, self.w1[0]) - \
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes, :kept_modes].imag, self.w1[1]) + \
+            self.b1[0]
+        )
+
+        o1_imag[:, total_modes-kept_modes:total_modes, :kept_modes] = F.relu(
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes, :kept_modes].imag, self.w1[0]) + \
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes, :kept_modes].real, self.w1[1]) + \
+            self.b1[1]
+        )
+
+        o2_real[:, total_modes-kept_modes:total_modes, :kept_modes]  = (
+            torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes, :kept_modes], self.w2[0]) - \
+            torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes, :kept_modes], self.w2[1]) + \
+            self.b2[0]
+        )
+
+        o2_imag[:, total_modes-kept_modes:total_modes, :kept_modes]  = (
+            torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes, :kept_modes], self.w2[0]) + \
+            torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes, :kept_modes], self.w2[1]) + \
+            self.b2[1]
+        )
+
+        x = torch.stack([o2_real, o2_imag], dim=-1)
+        x = F.softshrink(x, lambd=self.sparsity_threshold)
+        x = torch.view_as_complex(x)
+        x = x.reshape(B, H, W // 2 + 1, C)
+        x = torch.fft.irfft2(x, s=(H, W), dim=(1,2), norm="ortho")
+        x = x.type(dtype)
+
+        return x
 
     def forward(self, x):
         bias = x
-        dtype = x.dtype
-        x = x.float()
-        B, H, W, C = x.shape 
-
-        x_fft = torch.fft.rfft2(x, dim=(1, 2), norm="ortho")
-
-        assert C % self.num_blocks == 0, "C must be divisible by num_blocks"
-        block_size = C // self.num_blocks
-
-        x_fft = x_fft.reshape(B, H, W // 2 + 1, self.num_blocks, block_size)
-
-        o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, block_size * self.hidden_size_factor], device=x.device)
-        o1_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, block_size * self.hidden_size_factor], device=x.device)
-        o2_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, block_size], device=x.device)
-        o2_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, block_size], device=x.device)
-
-        total_modes = W // 2 + 1
-        kept_modes = int(total_modes * self.hard_thresholding_fraction)
-
-        for _ in range(self.iterations):
-            # Real part einsum operation
-            o1_real[:, :, :kept_modes] = F.relu(
-                torch.einsum('bhkci, cijk -> bhkcj', x_fft[:, :, :kept_modes].real, self.w1[0]) -
-                torch.einsum('bhkci, cijk -> bhkcj', x_fft[:, :, :kept_modes].imag, self.w1[1]) +
-                self.b1[0].unsqueeze(0).unsqueeze(0).unsqueeze(0)
-            )
-
-            # Imaginary part einsum operation
-            o1_imag[:, :, :kept_modes] = F.relu(
-                torch.einsum('bhkci, cijk -> bhkcj', x_fft[:, :, :kept_modes].imag, self.w1[0]) +
-                torch.einsum('bhkci, cijk -> bhkcj', x_fft[:, :, :kept_modes].real, self.w1[1]) +
-                self.b1[1].unsqueeze(0).unsqueeze(0).unsqueeze(0)
-            )
-
-            # Real part einsum operation for o2
-            o2_real[:, :, :kept_modes] = (
-                torch.einsum('bhkcj, cjik -> bhkci', o1_real[:, :, :kept_modes], self.w2[0]) -
-                torch.einsum('bhkcj, cjik -> bhkci', o1_imag[:, :, :kept_modes], self.w2[1]) +
-                self.b2[0].unsqueeze(0).unsqueeze(0).unsqueeze(0)
-            )
-
-            # Imaginary part einsum operation for o2
-            o2_imag[:, :, :kept_modes] = (
-                torch.einsum('bhkcj, cjik -> bhkci', o1_imag[:, :, :kept_modes], self.w2[0]) +
-                torch.einsum('bhkcj, cjik -> bhkci', o1_real[:, :, :kept_modes], self.w2[1]) +
-                self.b2[1].unsqueeze(0).unsqueeze(0).unsqueeze(0)
-            )
-
-            # Combine real and imaginary parts
-            x_fft = torch.stack([o2_real, o2_imag], dim=-1)
-            x_fft = F.softshrink(x_fft, lambd=self.sparsity_threshold)
-            x_fft = torch.view_as_complex(x_fft)
-
-            x_fft = x_fft.reshape(B, H, W // 2 + 1, C)
-            x = torch.fft.irfft2(x_fft.float(), s=(H, W), dim=(1, 2), norm="ortho")
-            x = x.type(dtype)
-
-            x = x + bias
-            
+        x0 = x.clone()
+        for _ in range(self.max_iter):
+            x_new = bias + self.apply_filter(x0)
+            diff = torch.norm(x_new - x0) / torch.norm(x_new)
+            if diff < self.tol:
+                break
+            x0 = x_new
+        x = x_new
         return x
 
 
@@ -137,13 +141,14 @@ class Block(nn.Module):
             double_skip=True,
             num_blocks=8,
             sparsity_threshold=0.01,
-            hard_thresholding_fraction=1.0
+            hard_thresholding_fraction=1.0,
+            max_iter=10,
+            tol=1e-6,
         ):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.filter = AFNO2D(dim, num_blocks, sparsity_threshold, hard_thresholding_fraction) 
+        self.filter = AFNO2D(dim, num_blocks, sparsity_threshold, hard_thresholding_fraction, max_iter=max_iter, tol=tol)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        #self.drop_path = nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
@@ -164,6 +169,7 @@ class Block(nn.Module):
         x = x + residual
         return x
 
+
 class PrecipNet(nn.Module):
     def __init__(self, params, backbone):
         super().__init__()
@@ -183,6 +189,7 @@ class PrecipNet(nn.Module):
         x = self.act(x)
         return x
 
+
 class AFNONet(nn.Module):
     def __init__(
             self,
@@ -199,6 +206,8 @@ class AFNONet(nn.Module):
             num_blocks=16,
             sparsity_threshold=0.01,
             hard_thresholding_fraction=1.0,
+            max_iter=10,
+            tol=1e-6,
         ):
         super().__init__()
         self.params = params
@@ -207,7 +216,7 @@ class AFNONet(nn.Module):
         self.in_chans = params.N_in_channels
         self.out_chans = params.N_out_channels
         self.num_features = self.embed_dim = embed_dim
-        self.num_blocks = params.num_blocks 
+        self.num_blocks = params.num_blocks
         norm_layer = partial(nn.LayerNorm, eps=1e-6)
 
         self.patch_embed = PatchEmbed(img_size=img_size, patch_size=self.patch_size, in_chans=self.in_chans, embed_dim=embed_dim)
@@ -222,13 +231,16 @@ class AFNONet(nn.Module):
         self.w = img_size[1] // self.patch_size[1]
 
         self.blocks = nn.ModuleList([
-            Block(dim=embed_dim, mlp_ratio=mlp_ratio, drop=drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
-            num_blocks=self.num_blocks, sparsity_threshold=sparsity_threshold, hard_thresholding_fraction=hard_thresholding_fraction) 
-        for i in range(depth)])
+            Block(
+                dim=embed_dim, mlp_ratio=mlp_ratio, drop=drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
+                num_blocks=self.num_blocks, sparsity_threshold=sparsity_threshold, hard_thresholding_fraction=hard_thresholding_fraction,
+                max_iter=max_iter, tol=tol
+            )
+            for i in range(depth)])
 
         self.norm = norm_layer(embed_dim)
 
-        self.head = nn.Linear(embed_dim, self.out_chans*self.patch_size[0]*self.patch_size[1], bias=False)
+        self.head = nn.Linear(embed_dim, self.out_chans * self.patch_size[0] * self.patch_size[1], bias=False)
 
         trunc_normal_(self.pos_embed, std=.02)
         self.apply(self._init_weights)
@@ -251,7 +263,7 @@ class AFNONet(nn.Module):
         x = self.patch_embed(x)
         x = x + self.pos_embed
         x = self.pos_drop(x)
-        
+
         x = x.reshape(B, self.h, self.w, self.embed_dim)
         for blk in self.blocks:
             x = blk(x)
@@ -271,6 +283,7 @@ class AFNONet(nn.Module):
         )
         return x
 
+
 class PatchEmbed(nn.Module):
     def __init__(self, img_size=(224, 224), patch_size=(16, 16), in_chans=3, embed_dim=768):
         super().__init__()
@@ -282,15 +295,22 @@ class PatchEmbed(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        assert H == self.img_size[0] and W == self.img_size[1], f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+        assert H == self.img_size[0] and W == self.img_size[1], \
+            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
         x = self.proj(x).flatten(2).transpose(1, 2)
         return x
 
 
 if __name__ == "__main__":
-    model = AFNONet(img_size=(720, 1440), patch_size=(4,4), in_chans=3, out_chans=10)
+    class Params:
+        patch_size = 4
+        N_in_channels = 3
+        N_out_channels = 10
+        num_blocks = 8
+
+    params = Params()
+    model = AFNONet(params=params, img_size=(720, 1440), patch_size=(4, 4), in_chans=3, out_chans=10)
     sample = torch.randn(1, 3, 720, 1440)
     result = model(sample)
     print(result.shape)
     print(torch.norm(result))
-

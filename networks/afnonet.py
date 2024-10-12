@@ -74,7 +74,7 @@ class AFNO2D(nn.Module):
         x = x.float()
         B, H, W, C = x.shape
 
-        x = dht2(x)
+        x = self.dht2(x)
         x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
 
         o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
@@ -114,7 +114,7 @@ class AFNO2D(nn.Module):
         x = F.softshrink(x, lambd=self.sparsity_threshold)
         x = torch.view_as_complex(x)
         x = x.reshape(B, H, W // 2 + 1, C)
-        x = idht2(x)
+        x = self.idht2(x)
         x = x.type(dtype)
 
         return x + bias

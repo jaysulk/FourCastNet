@@ -84,29 +84,29 @@ class AFNO2D(nn.Module):
             
             # Real part einsum operation
             o1_real[:, :, :kept_modes] = F.relu(
-                torch.einsum('bhwcj,bcjo->bhwjo', x_fft[:, :, :kept_modes].real, self.w1[0]) - \
-                torch.einsum('bhwcj,bcjo->bhwjo', x_fft[:, :, :kept_modes].imag, self.w1[1]) + \
+                torch.einsum('bhwfc,bcij->bhwfj', x_fft[:, :, :kept_modes].real, self.w1[0]) - \
+                torch.einsum('bhwfc,bcij->bhwfj', x_fft[:, :, :kept_modes].imag, self.w1[1]) + \
                 self.b1[0]
             )
             
             # Imaginary part einsum operation
             o1_imag[:, :, :kept_modes] = F.relu(
-                torch.einsum('bhwcj,bcjo->bhwjo', x_fft[:, :, :kept_modes].imag, self.w1[0]) + \
-                torch.einsum('bhwcj,bcjo->bhwjo', x_fft[:, :, :kept_modes].real, self.w1[1]) + \
+                torch.einsum('bhwfc,bcij->bhwfj', x_fft[:, :, :kept_modes].imag, self.w1[0]) + \
+                torch.einsum('bhwfc,bcij->bhwfj', x_fft[:, :, :kept_modes].real, self.w1[1]) + \
                 self.b1[1]
             )
             
             # Real part einsum operation for o2
             o2_real[:, :, :kept_modes] = (
-                torch.einsum('bhwjo,bcjo->bhwcj', o1_real[:, :, :kept_modes], self.w2[0]) - \
-                torch.einsum('bhwjo,bcjo->bhwcj', o1_imag[:, :, :kept_modes], self.w2[1]) + \
+                torch.einsum('bhwfj,bcij->bhwfc', o1_real[:, :, :kept_modes], self.w2[0]) - \
+                torch.einsum('bhwfj,bcij->bhwfc', o1_imag[:, :, :kept_modes], self.w2[1]) + \
                 self.b2[0]
             )
             
             # Imaginary part einsum operation for o2
             o2_imag[:, :, :kept_modes] = (
-                torch.einsum('bhwjo,bcjo->bhwcj', o1_imag[:, :, :kept_modes], self.w2[0]) + \
-                torch.einsum('bhwjo,bcjo->bhwcj', o1_real[:, :, :kept_modes], self.w2[1]) + \
+                torch.einsum('bhwfj,bcij->bhwfc', o1_imag[:, :, :kept_modes], self.w2[0]) + \
+                torch.einsum('bhwfj,bcij->bhwfc', o1_real[:, :, :kept_modes], self.w2[1]) + \
                 self.b2[1]
             )
 
@@ -121,6 +121,7 @@ class AFNO2D(nn.Module):
             x = x + bias
 
         return x
+
 
         
 class Block(nn.Module):

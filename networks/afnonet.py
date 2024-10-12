@@ -19,7 +19,6 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from utils.img_utils import PeriodicPad2d
 
-
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
@@ -37,8 +36,7 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         x = self.drop(x)
         return x
-
-
+        
 class AFNO2D(nn.Module):
     def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, 
                  hard_thresholding_fraction=1, hidden_size_factor=1, iterations=3):
@@ -122,8 +120,6 @@ class AFNO2D(nn.Module):
 
         return x
 
-
-        
 class Block(nn.Module):
     def __init__(
             self,
@@ -269,7 +265,6 @@ class AFNONet(nn.Module):
             w=self.img_size[1] // self.patch_size[1],
         )
         return x
-
 
 class PatchEmbed(nn.Module):
     def __init__(self, img_size=(224, 224), patch_size=(16, 16), in_chans=3, embed_dim=768):

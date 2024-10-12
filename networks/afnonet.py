@@ -39,27 +39,23 @@ class Mlp(nn.Module):
         return x
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 class AFNO2D(nn.Module):
-    def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1.0, hidden_size_factor=1):
+    def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
         super().__init__()
-        assert hidden_size % num_blocks == 0, f"hidden_size {hidden_size} should be divisible by num_blocks {num_blocks}"
+        assert hidden_size % num_blocks == 0, f"hidden_size {hidden_size} should be divisble by num_blocks {num_blocks}"
 
         self.hidden_size = hidden_size
+        self.sparsity_threshold = sparsity_threshold
         self.num_blocks = num_blocks
-        self.block_size = hidden_size // num_blocks
+        self.block_size = self.hidden_size // self.num_blocks
         self.hard_thresholding_fraction = hard_thresholding_fraction
         self.hidden_size_factor = hidden_size_factor
         self.scale = 0.02
 
-        # Initialize weights and biases for linear transformations
-        self.w1 = nn.Parameter(self.scale * torch.randn(self.num_blocks, self.block_size, self.block_size * self.hidden_size_factor))
-        self.b1 = nn.Parameter(self.scale * torch.randn(self.num_blocks, self.block_size * self.hidden_size_factor))
-        self.w2 = nn.Parameter(self.scale * torch.randn(self.num_blocks, self.block_size * self.hidden_size_factor, self.block_size))
-        self.b2 = nn.Parameter(self.scale * torch.randn(self.num_blocks, self.block_size))
+        self.w1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size, self.block_size * self.hidden_size_factor))
+        self.b1 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor))
+        self.w2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor, self.block_size))
+        self.b2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size))
 
     def dht2(self, x):
         # Perform the 2D Hartley Transform using FFT
@@ -70,55 +66,58 @@ class AFNO2D(nn.Module):
     def idht2(self, x):
         # The inverse DHT is the DHT itself when properly normalized
         return self.dht2(x)
-
+    
     def forward(self, x):
         bias = x
+
         dtype = x.dtype
         x = x.float()
         B, H, W, C = x.shape
 
-        # Reshape x to (B, C, H, W) for FFT
-        x = x.permute(0, 3, 1, 2)  # Shape: (B, C, H, W)
+        x = dht2(x)
+        x = x.reshape(B, H, W // 2 + 1, self.num_blocks, self.block_size)
 
-        # Compute the DHT over spatial dimensions
-        x_dht = self.dht2(x)  # Shape: (B, C, H, W)
+        o1_real = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
+        o1_imag = torch.zeros([B, H, W // 2 + 1, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
+        o2_real = torch.zeros(x.shape, device=x.device)
+        o2_imag = torch.zeros(x.shape, device=x.device)
 
-        # Reshape to (B, C, H*W)
-        x_dht = x_dht.reshape(B, C, H * W)
 
-        # Split into blocks along the channel dimension
-        x_dht = x_dht.reshape(B, self.num_blocks, self.block_size, H * W)
+        total_modes = H // 2 + 1
+        kept_modes = int(total_modes * self.hard_thresholding_fraction)
 
-        # Apply linear transformations block-wise
-        x_dht_out = torch.zeros_like(x_dht)
+        o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[0]) - \
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[1]) + \
+            self.b1[0]
+        )
 
-        for i in range(self.num_blocks):
-            block_x = x_dht[:, i, :, :]  # Shape: (B, block_size, H*W)
+        o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].imag, self.w1[0]) + \
+            torch.einsum('...bi,bio->...bo', x[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes].real, self.w1[1]) + \
+            self.b1[1]
+        )
 
-            # Apply hard thresholding along the spatial dimension
-            total_modes = H * W
-            kept_modes = int(total_modes * self.hard_thresholding_fraction)
-            if kept_modes < total_modes:
-                block_x[:, :, kept_modes:] = 0
+        o2_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]  = (
+            torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) - \
+            torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
+            self.b2[0]
+        )
 
-            # Linear transformations
-            block_x = torch.einsum('bik,ko->bio', block_x, self.w1[i]) + self.b1[i]
-            block_x = F.gelu(block_x)
-            block_x = torch.einsum('bio,oj->bij', block_x, self.w2[i]) + self.b2[i]
-            x_dht_out[:, i, :, :] = block_x
+        o2_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]  = (
+            torch.einsum('...bi,bio->...bo', o1_imag[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) + \
+            torch.einsum('...bi,bio->...bo', o1_real[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) + \
+            self.b2[1]
+        )
 
-        # Reshape back to (B, C, H, W)
-        x_dht_out = x_dht_out.reshape(B, C, H, W)
+        x = torch.stack([o2_real, o2_imag], dim=-1)
+        x = F.softshrink(x, lambd=self.sparsity_threshold)
+        x = torch.view_as_complex(x)
+        x = x.reshape(B, H, W // 2 + 1, C)
+        x = idht2(x)
+        x = x.type(dtype)
 
-        # Compute the inverse DHT
-        x_idht = self.idht2(x_dht_out)  # Shape: (B, C, H, W)
-
-        # Reshape back to original format (B, H, W, C)
-        x_idht = x_idht.permute(0, 2, 3, 1)
-        x_idht = x_idht.type(dtype)
-
-        return x_idht + bias
-
+        return x + bias
 
 
 class Block(nn.Module):

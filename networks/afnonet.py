@@ -1,4 +1,3 @@
-
 import math
 from functools import partial
 import torch
@@ -6,33 +5,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-import torch
 
 def dht2d(x: torch.Tensor, dim=None) -> torch.Tensor:
-    # Compute the N-dimensional FFT of the input tensor
     result = torch.fft.fftn(x, dim=dim)
-    
-    # Combine real and imaginary parts to compute the DHT
-    return result.real + result.imag  # Use subtraction to match DHT definition
+    return result.real + result.imag
+
 
 def idht2d(x: torch.Tensor, dim=None) -> torch.Tensor:
-    # Compute the DHT of the input tensor
     transformed = dht2d(x, dim=dim)
-    
-    # Determine normalization factor based on the specified dimensions
     if dim is None:
-        # If dim is None, use the total number of elements
         normalization_factor = x.numel()
     else:
-        # Ensure dim is a list of dimensions
         if isinstance(dim, int):
             dim = [dim]
         normalization_factor = 1
         for d in dim:
             normalization_factor *= x.size(d)
-    
-    # Return the normalized inverse DHT
     return transformed / normalization_factor
+
 
 class AFNO2D(nn.Module):
     def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
@@ -55,24 +45,21 @@ class AFNO2D(nn.Module):
     def forward(self, x):
         bias = x
         dtype = x.dtype
-        x = x.float()  # Convert to float32 for processing
+        x = x.float()
         B, H, W, C = x.shape
 
-        # Apply the DHT instead of FFT
-        X_H_k = dht2d(x)  # DHT of x (positive frequency component)
-        X_H_neg_k = torch.roll(torch.flip(x, dims=[1, 2]), shifts=(1, 1), dims=[1, 2])  # Negative frequency component
+        X_H_k = dht2d(x)
+        X_H_neg_k = torch.roll(torch.flip(x, dims=[1, 2]), shifts=(1, 1), dims=[1, 2])
 
         block_size = self.block_size
         hidden_size_factor = self.hidden_size_factor
 
-        # Ensure o1 and o2 dimensions match the expected sizes
         o1_H_k = torch.zeros([B, H, W, self.num_blocks, self.block_size * hidden_size_factor], device=x.device)
         o1_H_neg_k = torch.zeros([B, H, W, self.num_blocks, self.block_size * hidden_size_factor], device=x.device)
 
         total_modes = H // 2 + 1
         kept_modes = int(total_modes * self.hard_thresholding_fraction)
 
-        # Reshape and align the dimensions of X_H_k and X_H_neg_k for broadcasting
         X_H_k = X_H_k.reshape(B, H, W, self.num_blocks, block_size)
         X_H_neg_k = X_H_neg_k.reshape(B, H, W, self.num_blocks, block_size)
 
@@ -120,17 +107,47 @@ class AFNO2D(nn.Module):
         # Combine positive and negative frequency components back
         x = o2_H_k + o2_H_neg_k
 
-        # Optional: Adjust or remove softshrink based on performance
         if self.sparsity_threshold > 0:
-            # Adjust the threshold for softshrink or use an alternative method
-            x = F.softshrink(x, lambd=self.sparsity_threshold)  # You can reduce or adjust lambd here
-        
-        # Reshape and apply the inverse DHT
+            x = F.softshrink(x, lambd=self.sparsity_threshold)
+
         x = x.reshape(B, H, W, C)
         x = idht2d(x)
-        x = x.type(dtype)  # Convert back to original data type
+        x = x.type(dtype)
 
         return x + bias
+
+
+class AFNONet(nn.Module):
+    def __init__(self, img_size=(720, 1440), patch_size=(16, 16), in_chans=2, out_chans=2, embed_dim=768):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.in_chans = in_chans
+        self.out_chans = out_chans
+
+        self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_embed.num_patches, embed_dim))
+        self.pos_drop = nn.Dropout(p=0.1)
+
+        self.blocks = nn.ModuleList([
+            Block(embed_dim, mlp_ratio=4.) for _ in range(12)
+        ])
+        self.head = nn.Linear(embed_dim, out_chans * patch_size[0] * patch_size[1], bias=False)
+
+    def forward(self, x):
+        B = x.shape[0]
+        x = self.patch_embed(x)
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+        x = rearrange(x, 'b p e -> b e p')
+
+        for blk in self.blocks:
+            x = blk(x)
+
+        x = self.head(x)
+        x = rearrange(x, "b p (h w c) -> b c h w", h=self.img_size[0] // self.patch_size[0], w=self.img_size[1] // self.patch_size[1])
+        return x
+
 
 class Block(nn.Module):
     def __init__(
@@ -170,6 +187,7 @@ class Block(nn.Module):
         x = x + residual
         return x
 
+
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
@@ -188,89 +206,6 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
-class AFNONet(nn.Module):
-    def __init__(
-            self,
-            params,
-            img_size=(720, 1440),
-            patch_size=(16, 16),
-            in_chans=2,
-            out_chans=2,
-            embed_dim=768,
-            depth=12,
-            mlp_ratio=4.,
-            drop_rate=0.,
-            drop_path_rate=0.,
-            num_blocks=16,
-            sparsity_threshold=0.01,
-            hard_thresholding_fraction=1.0,
-        ):
-        super().__init__()
-        self.params = params
-        self.img_size = img_size
-        self.patch_size = (params.patch_size, params.patch_size)
-        self.in_chans = params.N_in_channels
-        self.out_chans = params.N_out_channels
-        self.num_features = self.embed_dim = embed_dim
-        self.num_blocks = params.num_blocks 
-        norm_layer = partial(nn.LayerNorm, eps=1e-6)
-
-        self.patch_embed = PatchEmbed(img_size=img_size, patch_size=self.patch_size, in_chans=self.in_chans, embed_dim=embed_dim)
-        num_patches = self.patch_embed.num_patches
-
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
-        self.pos_drop = nn.Dropout(p=drop_rate)
-
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-
-        self.h = img_size[0] // self.patch_size[0]
-        self.w = img_size[1] // self.patch_size[1]
-
-        self.blocks = nn.ModuleList([
-            Block(dim=embed_dim, mlp_ratio=mlp_ratio, drop=drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
-            num_blocks=self.num_blocks, sparsity_threshold=sparsity_threshold, hard_thresholding_fraction=hard_thresholding_fraction) 
-        for i in range(depth)])
-
-        self.norm = norm_layer(embed_dim)
-
-        self.head = nn.Linear(embed_dim, self.out_chans * self.patch_size[0] * self.patch_size[1], bias=False)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.zeros_(m.bias)
-                nn.init.ones_(m.weight)
-
-    def forward_features(self, x):
-        B = x.shape[0]
-        x = self.patch_embed(x)
-        x = x + self.pos_embed
-        x = self.pos_drop(x)
-        
-        x = x.reshape(B, self.h, self.w, self.embed_dim)
-        for blk in self.blocks:
-            x = blk(x)
-
-        return x
-
-    def forward(self, x):
-        x = self.forward_features(x)
-        x = self.head(x)
-        x = rearrange(
-            x,
-            "b h w (p1 p2 c_out) -> b c_out (h p1) (w p2)",
-            p1=self.patch_size[0],
-            p2=self.patch_size[1],
-            h=self.img_size[0] // self.patch_size[0],
-            w=self.img_size[1] // self.patch_size[1],
-        )
-        return x
 
 class PatchEmbed(nn.Module):
     def __init__(self, img_size=(720, 1440), patch_size=(16, 16), in_chans=2, embed_dim=768):
@@ -289,8 +224,8 @@ class PatchEmbed(nn.Module):
 
 
 if __name__ == "__main__":
-    model = AFNONet(img_size=(720, 1440), patch_size=(4, 4), in_chans=20, out_chans=10)
-    sample = torch.randn(1, 20, 720, 1440)  # Shape: [B, D, H, W]
+    model = AFNONet(img_size=(720, 1440), patch_size=(16, 16), in_chans=2, out_chans=2, embed_dim=768)
+    sample = torch.randn(1, 2, 720, 1440)  # Shape: [B, D, H, W]
     result = model(sample)
     print(result.shape)
     print(torch.norm(result))

@@ -1,48 +1,43 @@
-#reference: https://github.com/NVlabs/AFNO-transformer
 
 import math
 from functools import partial
-from collections import OrderedDict
-from copy import Error, deepcopy
-from re import S
-from numpy.lib.arraypad import pad
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-#from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.models.layers import DropPath, trunc_normal_
-import torch.fft
-from torch.nn.modules.container import Sequential
-from torch.utils.checkpoint import checkpoint_sequential
-from einops import rearrange, repeat
-from einops.layers.torch import Rearrange
-from utils.img_utils import PeriodicPad2d
+from einops import rearrange
 
+import torch
 
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
+def dht2d(x: torch.Tensor, dim=None) -> torch.Tensor:
+    # Compute the N-dimensional FFT of the input tensor
+    result = torch.fft.fftn(x, dim=dim)
+    
+    # Combine real and imaginary parts to compute the DHT
+    return result.real + result.imag  # Use subtraction to match DHT definition
 
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
-
+def idht2d(x: torch.Tensor, dim=None) -> torch.Tensor:
+    # Compute the DHT of the input tensor
+    transformed = dht2d(x, dim=dim)
+    
+    # Determine normalization factor based on the specified dimensions
+    if dim is None:
+        # If dim is None, use the total number of elements
+        normalization_factor = x.numel()
+    else:
+        # Ensure dim is a list of dimensions
+        if isinstance(dim, int):
+            dim = [dim]
+        normalization_factor = 1
+        for d in dim:
+            normalization_factor *= x.size(d)
+    
+    # Return the normalized inverse DHT
+    return transformed / normalization_factor
 
 class AFNO2D(nn.Module):
     def __init__(self, hidden_size, num_blocks=8, sparsity_threshold=0.01, hard_thresholding_fraction=1, hidden_size_factor=1):
         super().__init__()
-        assert hidden_size % num_blocks == 0, f"hidden_size {hidden_size} should be divisble by num_blocks {num_blocks}"
+        assert hidden_size % num_blocks == 0, f"hidden_size {hidden_size} should be divisible by num_blocks {num_blocks}"
 
         self.hidden_size = hidden_size
         self.sparsity_threshold = sparsity_threshold
@@ -57,64 +52,84 @@ class AFNO2D(nn.Module):
         self.w2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size * self.hidden_size_factor, self.block_size))
         self.b2 = nn.Parameter(self.scale * torch.randn(2, self.num_blocks, self.block_size))
 
-    def dht2(self, x):
-        # Perform the 2D Hartley Transform using FFT
-        fft_x = torch.fft.fft2(x, dim=(1, 2), norm="ortho")
-        dht_x = fft_x.real - fft_x.imag  # DHT relationship with FFT
-        return dht_x
-
-    def idht2(self, x):
-        # Perform the inverse 2D Hartley Transform using inverse FFT
-        fft_x = torch.fft.ifft2(x, dim=(1, 2), norm="ortho")
-        idht_x = fft_x.real - fft_x.imag  # IDHT relationship with IFFT
-        
-        # Normalize by the number of elements in the transformed dimensions (H * W)
-        H, W = x.shape[1:3]  # Assuming x is (B, H, W, ...)
-        idht_x = idht_x * (H * W)
-        
-        return idht_x
-
     def forward(self, x):
         bias = x
-    
         dtype = x.dtype
-        x = x.float()
+        x = x.float()  # Convert to float32 for processing
         B, H, W, C = x.shape
-    
-        # Use DHT instead of rfft2
-        X_H_k = self.dht2(x)  # DHT of x (positive frequency component)
+
+        # Apply the DHT instead of FFT
+        X_H_k = dht2d(x)  # DHT of x (positive frequency component)
         X_H_neg_k = torch.roll(torch.flip(x, dims=[1, 2]), shifts=(1, 1), dims=[1, 2])  # Negative frequency component
-    
-        # Reshape if needed, depending on how self.dht2d(x) returns
-        X_H_k = X_H_k.reshape(B, H, W, self.num_blocks, self.block_size)
-        X_H_neg_k = X_H_neg_k.reshape(B, H, W, self.num_blocks, self.block_size)
-    
-        o1 = torch.zeros([B, H, W, self.num_blocks, self.block_size * self.hidden_size_factor], device=x.device)
-        o2 = torch.zeros(X_H_k.shape, device=x.device)
-    
+
+        block_size = self.block_size
+        hidden_size_factor = self.hidden_size_factor
+
+        # Ensure o1 and o2 dimensions match the expected sizes
+        o1_H_k = torch.zeros([B, H, W, self.num_blocks, self.block_size * hidden_size_factor], device=x.device)
+        o1_H_neg_k = torch.zeros([B, H, W, self.num_blocks, self.block_size * hidden_size_factor], device=x.device)
+
         total_modes = H // 2 + 1
         kept_modes = int(total_modes * self.hard_thresholding_fraction)
-    
-        # Apply the Hartley convolution formula using positive and negative components
-        X1_pos = X_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]
-        X1_neg = X_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes]
-    
-        # Hartley convolution terms
-        conv_hartley = 0.5 * (
-            X1_pos * X1_pos - X1_neg * X1_neg +
-            X1_pos * X1_neg + X1_neg * X1_pos
+
+        # Reshape and align the dimensions of X_H_k and X_H_neg_k for broadcasting
+        X_H_k = X_H_k.reshape(B, H, W, self.num_blocks, block_size)
+        X_H_neg_k = X_H_neg_k.reshape(B, H, W, self.num_blocks, block_size)
+
+        # First multiplication for positive and negative frequency components
+        o1_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
+            0.5 * (
+                torch.einsum('...bi,bio->...bo', X_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0]) -
+                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[1]) +
+                torch.einsum('...bi,bio->...bo', X_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[1]) +
+                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0])
+            ) + self.b1[0]
         )
-    
-        o1[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(conv_hartley + self.b1[0])
-    
-        o2[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
-            torch.einsum('...bi,bio->...bo', o1[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) + self.b2[0]
+
+        o1_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = F.relu(
+            0.5 * (
+                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0]) -
+                torch.einsum('...bi,bio->...bo', X_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[1]) +
+                torch.einsum('...bi,bio->...bo', X_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[1]) +
+                torch.einsum('...bi,bio->...bo', X_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w1[0])
+            ) + self.b1[1]
         )
-    
-        # Use inverse DHT instead of irfft2
-        x = self.idht2(o2.reshape(B, H, W, C))
-        x = x.type(dtype)
-    
+
+        # Second multiplication for both positive and negative frequency components
+        o2_H_k = torch.zeros(X_H_k.shape, device=x.device)
+        o2_H_neg_k = torch.zeros(X_H_k.shape, device=x.device)
+
+        o2_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
+            0.5 * (
+                torch.einsum('...bi,bio->...bo', o1_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) -
+                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) +
+                torch.einsum('...bi,bio->...bo', o1_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) +
+                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0])
+            ) + self.b2[0]
+        )
+
+        o2_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes] = (
+            0.5 * (
+                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0]) -
+                torch.einsum('...bi,bio->...bo', o2_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) +
+                torch.einsum('...bi,bio->...bo', o1_H_neg_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[1]) +
+                torch.einsum('...bi,bio->...bo', o2_H_k[:, total_modes-kept_modes:total_modes+kept_modes, :kept_modes], self.w2[0])
+            ) + self.b2[1]
+        )
+
+        # Combine positive and negative frequency components back
+        x = o2_H_k + o2_H_neg_k
+
+        # Optional: Adjust or remove softshrink based on performance
+        if self.sparsity_threshold > 0:
+            # Adjust the threshold for softshrink or use an alternative method
+            x = F.softshrink(x, lambd=self.sparsity_threshold)  # You can reduce or adjust lambd here
+        
+        # Reshape and apply the inverse DHT
+        x = x.reshape(B, H, W, C)
+        x = idht2d(x)
+        x = x.type(dtype)  # Convert back to original data type
+
         return x + bias
 
 class Block(nn.Module):
@@ -134,8 +149,7 @@ class Block(nn.Module):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.filter = AFNO2D(dim, num_blocks, sparsity_threshold, hard_thresholding_fraction) 
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        #self.drop_path = nn.Identity()
+        self.drop_path = nn.Identity() if drop_path <= 0. else nn.Dropout(drop_path)
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
@@ -156,23 +170,22 @@ class Block(nn.Module):
         x = x + residual
         return x
 
-class PrecipNet(nn.Module):
-    def __init__(self, params, backbone):
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
-        self.params = params
-        self.patch_size = (params.patch_size, params.patch_size)
-        self.in_chans = params.N_in_channels
-        self.out_chans = params.N_out_channels
-        self.backbone = backbone
-        self.ppad = PeriodicPad2d(1)
-        self.conv = nn.Conv2d(self.out_chans, self.out_chans, kernel_size=3, stride=1, padding=0, bias=True)
-        self.act = nn.ReLU()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
 
     def forward(self, x):
-        x = self.backbone(x)
-        x = self.ppad(x)
-        x = self.conv(x)
+        x = self.fc1(x)
         x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
         return x
 
 class AFNONet(nn.Module):
@@ -220,23 +233,19 @@ class AFNONet(nn.Module):
 
         self.norm = norm_layer(embed_dim)
 
-        self.head = nn.Linear(embed_dim, self.out_chans*self.patch_size[0]*self.patch_size[1], bias=False)
+        self.head = nn.Linear(embed_dim, self.out_chans * self.patch_size[0] * self.patch_size[1], bias=False)
 
-        trunc_normal_(self.pos_embed, std=.02)
-        self.apply(self._init_weights)
+        self._init_weights()
 
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {'pos_embed', 'cls_token'}
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.zeros_(m.bias)
+                nn.init.ones_(m.weight)
 
     def forward_features(self, x):
         B = x.shape[0]
@@ -263,9 +272,8 @@ class AFNONet(nn.Module):
         )
         return x
 
-
 class PatchEmbed(nn.Module):
-    def __init__(self, img_size=(224, 224), patch_size=(16, 16), in_chans=3, embed_dim=768):
+    def __init__(self, img_size=(720, 1440), patch_size=(16, 16), in_chans=2, embed_dim=768):
         super().__init__()
         num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
         self.img_size = img_size
@@ -281,8 +289,8 @@ class PatchEmbed(nn.Module):
 
 
 if __name__ == "__main__":
-    model = AFNONet(img_size=(720, 1440), patch_size=(4,4), in_chans=3, out_chans=10)
-    sample = torch.randn(1, 3, 720, 1440)
+    model = AFNONet(img_size=(720, 1440), patch_size=(4, 4), in_chans=20, out_chans=10)
+    sample = torch.randn(1, 20, 720, 1440)  # Shape: [B, D, H, W]
     result = model(sample)
     print(result.shape)
     print(torch.norm(result))
